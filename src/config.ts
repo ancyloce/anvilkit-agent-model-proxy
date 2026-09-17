@@ -103,6 +103,8 @@ export interface Config {
 		retryMaxIntervalMs: number;
 		sweepIntervalMs: number;
 		reclaimGraceMs: number;
+		/** How long after a reclaim the pending marker stays so the lost sender's late evidence is still discovered. */
+		lateSettlementWindowMs: number;
 	};
 	contractsDir: string;
 	routes: Route[];
@@ -209,7 +211,13 @@ const defaults: Raw = {
 		backend: "filesystem",
 		s3: { region: "default", prefix: "model-proxy", path_style: true, qualify_on_start: true },
 	},
-	observation: { retry_initial: "1s", retry_max_interval: "30s", sweep_interval: "30s", reclaim_grace: "30s" },
+	observation: {
+		retry_initial: "1s",
+		retry_max_interval: "30s",
+		sweep_interval: "30s",
+		reclaim_grace: "30s",
+		late_settlement_window: "1h",
+	},
 	routes: [],
 };
 
@@ -248,6 +256,7 @@ const knownKeys = new Set([
 	"observation.retry_max_interval",
 	"observation.sweep_interval",
 	"observation.reclaim_grace",
+	"observation.late_settlement_window",
 	"routes",
 ]);
 
@@ -620,6 +629,7 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 			retryMaxIntervalMs: attempt(() => duration(raw, "observation.retry_max_interval", 10, 600_000), 10),
 			sweepIntervalMs: attempt(() => duration(raw, "observation.sweep_interval", 1000, 3_600_000), 1000),
 			reclaimGraceMs: attempt(() => duration(raw, "observation.reclaim_grace", 0, 3_600_000), 0),
+			lateSettlementWindowMs: attempt(() => duration(raw, "observation.late_settlement_window", 0, 604_800_000), 0),
 		},
 		contractsDir: str(raw, "contracts.dir"),
 		routes,
