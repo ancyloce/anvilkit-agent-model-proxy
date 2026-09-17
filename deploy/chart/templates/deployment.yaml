@@ -1,0 +1,166 @@
+{{- include "anvilkit-agent-model-proxy.require" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "anvilkit-agent-model-proxy.fullname" . }}
+  labels:
+    {{- include "anvilkit-agent-model-proxy.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "anvilkit-agent-model-proxy.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "anvilkit-agent-model-proxy.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: model-proxy
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # A changed configuration file rolls the Pods.
+        checksum/config: {{ include "anvilkit-agent-model-proxy.config" . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "anvilkit-agent-model-proxy.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      # No injected service-link variables: the configuration loader rejects
+      # any ANVILKIT_MODEL_PROXY_* variable outside its allowlist.
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: model-proxy
+          image: {{ include "anvilkit-agent-model-proxy.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          # The allowlisted environment overrides of src/config.ts: the file
+          # path, the placement values, the secrets from their Secrets and
+          # the credential of every served route.
+          env:
+            - name: ANVILKIT_MODEL_PROXY_CONFIG
+              value: /etc/anvilkit/anvilkit-agent-model-proxy/config.yaml
+            - name: ANVILKIT_MODEL_PROXY_CONTRACTS_DIR
+              value: /anvilkit/contracts
+            - name: ANVILKIT_MODEL_PROXY_LISTEN
+              value: {{ printf "%s:%d" .Values.listen.address (int .Values.listen.port) | quote }}
+            - name: ANVILKIT_MODEL_PROXY_HEALTH_LISTEN
+              value: {{ printf "0.0.0.0:%d" (int .Values.health.port) | quote }}
+            - name: ANVILKIT_MODEL_PROXY_CONTROL_ADDRESS
+              value: {{ .Values.control.address | quote }}
+            {{- if eq .Values.identity.mode "development" }}
+            - name: ANVILKIT_MODEL_PROXY_PRINCIPALS_FILE
+              value: /etc/anvilkit/model-proxy-principals/{{ .Values.identity.principalsSecret.key }}
+            {{- end }}
+            - name: ANVILKIT_MODEL_PROXY_STORE_S3_ENDPOINT
+              value: {{ .Values.store.s3.endpoint | quote }}
+            - name: ANVILKIT_MODEL_PROXY_STORE_S3_BUCKET
+              value: {{ .Values.store.s3.bucket | quote }}
+            - name: ANVILKIT_MODEL_PROXY_STORE_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.store.s3.secret.name }}
+                  key: {{ .Values.store.s3.secret.accessKeyIdKey }}
+            - name: ANVILKIT_MODEL_PROXY_STORE_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.store.s3.secret.name }}
+                  key: {{ .Values.store.s3.secret.secretAccessKeyKey }}
+            {{- range .Values.routeCredentials }}
+            - name: {{ .env }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secret.name }}
+                  key: {{ .secret.key }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.listen.port }}
+              protocol: TCP
+            - name: health
+              containerPort: {{ .Values.health.port }}
+              protocol: TCP
+          # The probes target the plaintext health listener in both identity
+          # modes: the kubelet presents no client certificate, and the mTLS
+          # business listener refuses a handshake without one.
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/anvilkit/anvilkit-agent-model-proxy
+              readOnly: true
+            {{- if eq .Values.identity.mode "development" }}
+            - name: principals
+              mountPath: /etc/anvilkit/model-proxy-principals
+              readOnly: true
+            {{- else }}
+            - name: mtls
+              mountPath: /etc/anvilkit/model-proxy-mtls
+              readOnly: true
+            {{- end }}
+            {{- if eq .Values.control.identity.mode "mtls" }}
+            - name: control-mtls
+              mountPath: /etc/anvilkit/control-mtls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "anvilkit-agent-model-proxy.fullname" . }}
+        {{- if eq .Values.identity.mode "development" }}
+        - name: principals
+          secret:
+            secretName: {{ .Values.identity.principalsSecret.name }}
+        {{- else }}
+        - name: mtls
+          secret:
+            secretName: {{ .Values.identity.mtlsSecret.name }}
+        {{- end }}
+        {{- if eq .Values.control.identity.mode "mtls" }}
+        - name: control-mtls
+          secret:
+            secretName: {{ .Values.control.identity.mtlsSecret.name }}
+        {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

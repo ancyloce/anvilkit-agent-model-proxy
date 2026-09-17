@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "anvilkit-agent-model-proxy.fullname" . }}
+  labels:
+    {{- include "anvilkit-agent-model-proxy.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "anvilkit-agent-model-proxy.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      appProtocol: {{ ternary "https" "http" (eq .Values.identity.mode "mtls") }}

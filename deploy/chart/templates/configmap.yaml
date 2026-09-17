@@ -1,0 +1,10 @@
+{{- include "anvilkit-agent-model-proxy.require" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "anvilkit-agent-model-proxy.fullname" . }}
+  labels:
+    {{- include "anvilkit-agent-model-proxy.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- include "anvilkit-agent-model-proxy.config" . | nindent 4 }}

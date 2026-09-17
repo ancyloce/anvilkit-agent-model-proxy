@@ -1,0 +1,205 @@
+# Chart values of anvilkit-agent-model-proxy. Only what this service needs:
+# its image, its reviewed configuration file (the routes included), the
+# allowlisted placement overrides, the Secrets its credentials come from,
+# probes, resources and a disruption budget. Environment values (addresses,
+# buckets, replica counts, Secret names, the pinned image digest) and the
+# route credentials themselves are supplied by the deploying repository per
+# environment; secrets never enter this chart, and a route whose credential
+# Secret is not referenced is not served.
+
+image:
+  repository: anvilkit-agent-model-proxy
+  tag: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: ""
+  # The Proxy needs no Kubernetes API access.
+  automountServiceAccountToken: false
+
+# The business listener inside the Pod (ANVILKIT_MODEL_PROXY_LISTEN); the
+# Service targets its port. Under identity.mode mtls it serves TLS with
+# mandatory client certificates.
+listen:
+  address: 0.0.0.0
+  port: 9103
+
+# The probe listener inside the Pod (ANVILKIT_MODEL_PROXY_HEALTH_LISTEN):
+# plaintext, /healthz and /readyz only, no identity and no business route.
+# The kubelet's httpGet probes present no client certificate, so they never
+# target the mTLS business listener; the Service does not expose this port.
+health:
+  port: 9104
+
+# Control's DispatchService (ANVILKIT_MODEL_PROXY_CONTROL_ADDRESS). Required.
+# identity.mode development is the plaintext gRPC of the development
+# foundation; mtls mounts the workload certificate files from mtlsSecret
+# (keys tls.crt, tls.key, ca.crt) at /etc/anvilkit/control-mtls.
+control:
+  address: ""
+  identity:
+    mode: development
+    mtlsSecret:
+      name: ""
+      serverName: ""
+
+# The callers' identity. development mounts the DEVELOPMENT_ONLY bearer
+# principals file from principalsSecret (key principals.json); mtls serves
+# TLS with the server certificate of mtlsSecret (tls.crt, tls.key, ca.crt)
+# and maps client certificate common names to caller kinds through
+# config.identity.mtls.principals.
+identity:
+  mode: development
+  principalsSecret:
+    name: ""
+    key: principals.json
+  mtlsSecret:
+    name: ""
+
+# The record and evidence store: in a cluster every replica must share one
+# backend, so the chart renders the S3 backend only (the filesystem adapter
+# is DEVELOPMENT_ONLY and per host). Endpoint and bucket are placements
+# (ANVILKIT_MODEL_PROXY_STORE_S3_{ENDPOINT,BUCKET}); the credentials come
+# from an existing Secret (ANVILKIT_MODEL_PROXY_STORE_S3_{ACCESS_KEY_ID,
+# SECRET_ACCESS_KEY}). Required.
+store:
+  s3:
+    endpoint: ""
+    bucket: ""
+    secret:
+      name: ""
+      accessKeyIdKey: accessKeyId
+      secretAccessKeyKey: secretAccessKey
+
+# Route credentials: one entry per served route, naming the environment
+# variable the route declares (credential_env) and the existing Secret and
+# key holding the provider credential. A route without an entry here is
+# declared but not served.
+routeCredentials: []
+#  - env: ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1
+#    secret:
+#      name: model-proxy-route-controlled
+#      key: credential
+
+# The reviewed, secret-free configuration file (config.yaml sections),
+# rendered into a ConfigMap and mounted at ANVILKIT_MODEL_PROXY_CONFIG. The
+# placement values above override it through the allowlisted environment;
+# the store backend is fixed to s3 here. routes is the reviewed route list
+# of the environment; the checked-in default declares the controlled route
+# of the verification scenarios and enables nothing.
+config:
+  http:
+    listen: 127.0.0.1:9103
+    max_body_bytes: 4194304
+    request_header_timeout: 10s
+    sse_heartbeat: 15s
+    slow_consumer_grace: 10s
+    shutdown_timeout: 20s
+  identity:
+    owner: anvilkit-agent-model-proxy
+    mtls:
+      principals: []
+  control:
+    timeout: 15s
+    admission_retry:
+      initial: 500ms
+      max_interval: 5s
+      max_attempts: 5
+  store:
+    backend: s3
+    s3:
+      region: default
+      prefix: model-proxy
+      path_style: true
+      qualify_on_start: true
+  observation:
+    retry_initial: 1s
+    retry_max_interval: 30s
+    sweep_interval: 30s
+    reclaim_grace: 30s
+  routes:
+    - id: controlled-openai-v1
+      enabled: false
+      api: openai-completions
+      provider: fixture
+      model: fixture-model
+      base_url: http://127.0.0.1:1/v1
+      credential_env: ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1
+      limits:
+        max_output_tokens: 4096
+        max_exposure: { currency: USD, amount: "1000000" }
+        max_deadline: 10m
+        max_frame_bytes: 65536
+        max_output_bytes: 1048576
+        max_frames: 4096
+        upstream_timeout: 5m
+        max_evidence_bytes: 4194304
+      tools:
+        - name: read_brief
+          description: Reads the frozen brief.
+          input_schema:
+            type: object
+            additionalProperties: false
+            properties:
+              section: { type: string, maxLength: 64 }
+
+service:
+  type: ClusterIP
+  port: 9103
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+# On the health port: /readyz answers 200 once the store is qualified, the
+# sweep ran and the business listener is up, 503 while the process drains;
+# /healthz answers while the process runs.
+probes:
+  startup:
+    periodSeconds: 2
+    failureThreshold: 60
+  readiness:
+    periodSeconds: 5
+    failureThreshold: 3
+  liveness:
+    periodSeconds: 10
+    failureThreshold: 3
+
+# Shutdown: the process drains within http.shutdown_timeout of the
+# configuration (in-flight sends run to their bounded end so their usage is
+# observed); the grace period must exceed it.
+terminationGracePeriodSeconds: 30
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+topologySpreadConstraints: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
