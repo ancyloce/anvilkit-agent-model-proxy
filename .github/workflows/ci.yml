@@ -1,0 +1,59 @@
+# Independent verification of anvilkit-agent-model-proxy from this repository
+# alone: the locked install (no lifecycle scripts), type check, lint, the
+# tests (the guarded transport and the call scenarios run against an
+# in-process controlled upstream and a fake Control; the S3 store test runs
+# only where the development foundation's MinIO is present), the build, the
+# image (the contract document from the contracts repository as a named
+# build context) and the chart's lint and render.
+name: ci
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+jobs:
+  node:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ancyloce/anvilkit-agent-contracts
+          ref: 972e11c83a2c6b3f36ba62de17bc2c0478f62d9b
+          path: contracts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24.19.0"
+      - run: npm install -g pnpm@12.3.4
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm run check-types
+      - run: pnpm run lint
+      - run: pnpm run build
+      - run: pnpm run test
+        env:
+          ANVILKIT_MODEL_PROXY_CONTRACTS_DIR: ${{ github.workspace }}/contracts
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ancyloce/anvilkit-agent-contracts
+          ref: 972e11c83a2c6b3f36ba62de17bc2c0478f62d9b
+          path: contracts
+      - run: docker build --build-context contracts=contracts -t anvilkit-agent-model-proxy:ci .
+  chart:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: "v3.19.0"
+      - run: >-
+          helm lint deploy/chart --set control.address=anvilkit-agent-control:9101
+          --set store.s3.endpoint=http://minio:9000 --set store.s3.bucket=anvilkit-model-proxy --set store.s3.secret.name=model-proxy-store
+          --set identity.principalsSecret.name=model-proxy-principals
+      - run: >-
+          helm template anvilkit-agent-model-proxy deploy/chart --set control.address=anvilkit-agent-control:9101
+          --set store.s3.endpoint=http://minio:9000 --set store.s3.bucket=anvilkit-model-proxy --set store.s3.secret.name=model-proxy-store
+          --set identity.principalsSecret.name=model-proxy-principals > /dev/null
