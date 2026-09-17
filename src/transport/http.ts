@@ -6,10 +6,14 @@
 // for the call's own caller only (the application decides). The stream is
 // encoded by eventsource-encoder (frames as `data`, the sequence as `id`,
 // keepalive comments), drops a slow consumer without touching the send,
-// and never carries native bodies. The probes (/healthz, /readyz) live on
-// a plaintext listener of their own: the kubelet presents no client
-// certificate, so they never share the mTLS business listener.
+// and never carries native bodies. The stream's lifecycle is the
+// response's (its close event, a drain awaited through events.once under an
+// abort signal), so a keep-alive connection serving many calls accumulates
+// no listener or timer. The probes (/healthz, /readyz) live on a plaintext
+// listener of their own: the kubelet presents no client certificate, so
+// they never share the mTLS business listener.
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
@@ -178,7 +182,7 @@ async function handle(d: HttpDeps, req: IncomingMessage, res: ServerResponse): P
 			const text = await readBody(req, d.cfg.http.maxBodyBytes);
 			const request = d.contract.parse<ModelCallRequest>("ModelCallRequest", text);
 			const stream = await d.calls.open(principal, request);
-			await writeSse(d, req, res, request.callId, stream);
+			await writeSse(d, res, request.callId, stream);
 			return;
 		}
 		const m = callPath.exec(url.pathname);
@@ -220,10 +224,17 @@ async function handle(d: HttpDeps, req: IncomingMessage, res: ServerResponse): P
 	}
 }
 
-/** Writes the frames as SSE (id = sequence); a slow consumer is dropped after the grace, the send continues. */
+/**
+ * Writes the frames as SSE (id = sequence); a slow consumer is dropped after
+ * the grace, the send continues. Everything registered here belongs to this
+ * response: the close listener (the connection went away, or the response
+ * completed) is removed when the write ends, a drain is awaited through
+ * events.once under a signal that fires on the grace or on the close, and
+ * the heartbeat timer is cleared — a keep-alive connection serving one call
+ * after another keeps nothing of the earlier ones.
+ */
 async function writeSse(
 	d: HttpDeps,
-	req: IncomingMessage,
 	res: ServerResponse,
 	callId: string,
 	frames: AsyncGenerator<StreamFrame>,
@@ -235,27 +246,29 @@ async function writeSse(
 		"x-accel-buffering": "no",
 	});
 	res.flushHeaders();
-	let closed = false;
-	req.socket.on("close", () => {
-		closed = true;
-	});
+	const closing = new AbortController();
+	const onClose = () => closing.abort();
+	res.once("close", onClose);
 	const heartbeat = setInterval(() => {
-		if (!closed) res.write(encodeComment("keepalive"));
+		if (!closing.signal.aborted) res.write(encodeComment("keepalive"));
 	}, d.cfg.http.sseHeartbeatMs);
-	const write = (chunk: string) =>
-		new Promise<boolean>((resolve) => {
-			if (closed) return resolve(false);
-			if (res.write(chunk)) return resolve(true);
-			const timer = setTimeout(() => {
-				d.log.warn("slow consumer dropped; the send continues", { callId });
-				res.destroy();
-				resolve(false);
-			}, d.cfg.http.slowConsumerGraceMs);
-			res.once("drain", () => {
-				clearTimeout(timer);
-				resolve(true);
+	const write = async (chunk: string): Promise<boolean> => {
+		if (closing.signal.aborted) return false;
+		if (res.write(chunk)) return true;
+		try {
+			await once(res, "drain", {
+				signal: AbortSignal.any([closing.signal, AbortSignal.timeout(d.cfg.http.slowConsumerGraceMs)]),
 			});
-		});
+			return true;
+		} catch {
+			if (!closing.signal.aborted) {
+				d.log.warn("slow consumer dropped; the send continues", { callId });
+				closing.abort();
+				res.destroy();
+			}
+			return false;
+		}
+	};
 	try {
 		for await (const f of frames) {
 			const violations = d.contract.check("StreamFrame", f);
@@ -263,6 +276,7 @@ async function writeSse(
 				// A defect of this service, never hidden by skipping the frame: the
 				// caller sees an interrupted stream, not a gap or a missing final frame.
 				d.log.error("frame outside the contract; the stream is cut", { callId, sequence: f.sequence, type: f.type });
+				closing.abort();
 				res.destroy();
 				break;
 			}
@@ -270,7 +284,8 @@ async function writeSse(
 		}
 	} finally {
 		clearInterval(heartbeat);
+		res.off("close", onClose);
 		await frames.return(undefined).catch(() => undefined);
-		if (!closed) res.end();
+		if (!closing.signal.aborted) res.end();
 	}
 }
