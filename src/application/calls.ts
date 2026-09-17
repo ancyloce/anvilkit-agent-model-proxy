@@ -7,12 +7,17 @@
 // (never a second send) and only for the call's own caller; express
 // cancellation as intent and keep incurred usage; complete a settlement
 // whose record write was lost from its evidence and reclaim sends this
-// process lost as unknown, never as sent-nothing. Control keeps the ledger;
-// this service keeps the sender's transport state.
+// process lost as unknown, never as sent-nothing. Every object of a call is
+// addressed by the call's scope (tenant and call id: Control's dispatch
+// identity without the constant owner), so two tenants' calls under one
+// call id never share a record, evidence, marker or cancel intent, and a
+// record is only ever taken over, attached to or settled by the identity it
+// was recorded for. Control keeps the ledger; this service keeps the
+// sender's transport state.
 
 import { ControlRefused, type DispatchPort } from "../adapters/control.js";
 import { streamUpstream } from "../adapters/piai.js";
-import { type CallStore, type NativeEvidence, PreconditionFailed } from "../adapters/store.js";
+import { type CallStore, evidenceKeyOf, type NativeEvidence, PreconditionFailed } from "../adapters/store.js";
 import { nativeUsageFromSse, SendTicket } from "../adapters/transport.js";
 import type { Config, Route } from "../config.js";
 import { routeDisabledReasons } from "../config.js";
@@ -29,12 +34,14 @@ import {
 import {
 	BoundExceeded,
 	type CallRecord,
+	type CallScope,
 	canonicalJson,
 	digestOf,
 	Frames,
 	isTerminal,
 	type Observation,
 	type Settlement,
+	scopeOf,
 	timestamp,
 	toModelCall,
 	toolSchemaDigest,
@@ -96,7 +103,7 @@ export interface CallDeps {
 
 /** An in-flight send owned by this process. */
 interface LiveCall {
-	callId: string;
+	scope: CallScope;
 	frames: StreamFrame[];
 	subscribers: Set<(f: StreamFrame | null) => void>;
 	abort: AbortController;
@@ -113,6 +120,9 @@ const sleep = (ms: number, signal?: AbortSignal) =>
 			resolve();
 		});
 	});
+
+/** The in-process key of a scope (the live sends and the retry loops). */
+const keyOf = (scope: CallScope) => `${scope.callId}/${scope.tenantId}`;
 
 export class CallService {
 	private readonly live = new Map<string, LiveCall>();
@@ -281,16 +291,47 @@ export class CallService {
 	}
 
 	/**
+	 * The one record a query names by call id alone. The transport carries
+	 * no tenant on a query or a cancel, so the record is the caller's (or,
+	 * for a query, readable by Control) among the tenants that used the id;
+	 * a caller whose calls of several tenants share the id is answered
+	 * nothing rather than one of them — nothing of another call is exposed
+	 * and no cancel lands on the wrong one.
+	 */
+	private async resolve(
+		principal: Principal,
+		callId: string,
+		own: boolean,
+	): Promise<{ record: CallRecord; version: string } | undefined> {
+		const readable: { record: CallRecord; version: string }[] = [];
+		for (const scope of await this.d.store.listCalls(callId)) {
+			const found = await this.d.store.read(scope);
+			if (!found) continue;
+			if (own ? this.isOwner(principal, found.record) : this.canRead(principal, found.record)) readable.push(found);
+		}
+		if (readable.length === 1) return readable[0];
+		if (readable.length > 1) {
+			this.d.log.warn("a call id names calls of several tenants for this caller; the query cannot name the tenant", {
+				callId,
+				principalId: principal.id,
+				tenants: readable.length,
+			});
+		}
+		return undefined;
+	}
+
+	/**
 	 * Opens the call: a reentry of a recorded call attaches to its record (or
 	 * its live send) and never sends again; a new call is admitted and, when
 	 * this request holds the permission, sent once. Returns the frame stream.
 	 */
 	async open(principal: Principal, req: ModelCallRequest): Promise<AsyncGenerator<StreamFrame>> {
+		const scope: CallScope = { tenantId: req.binding.tenantId, callId: req.callId };
 		const contentDigest = this.contentDigestOf(req);
 		// A recorded call is answered from its record whatever the clock
 		// says now: a reconnect or a late query keeps the original identity
 		// and never opens a new send.
-		const existing = await this.d.store.read(req.callId);
+		const existing = await this.d.store.read(scope);
 		if (existing) {
 			this.reentry(principal, existing.record, req, contentDigest);
 			return this.attach(existing.record, Date.parse(existing.record.deadline));
@@ -327,13 +368,13 @@ export class CallService {
 		// The pending marker precedes the record: from the moment a record
 		// that owes Control an observation exists, the sweep of any instance
 		// can discover it, however early this process is lost.
-		await this.d.store.markPending(req.callId, req.deadline);
+		await this.d.store.markPending(scope, req.deadline);
 		if (!admission.allowed) {
 			// The permission of this call was consumed by another request: a
 			// concurrent duplicate on another instance (its record appears
 			// shortly) or a lost first answer (nobody can send; the outcome is
 			// unknown until independently checkable evidence says otherwise).
-			const record = await this.awaitRecord(req.callId, this.d.cfg.control.admissionRetry.maxIntervalMs);
+			const record = await this.awaitRecord(scope, this.d.cfg.control.admissionRetry.maxIntervalMs);
 			if (record) {
 				this.reentry(principal, record, req, contentDigest);
 				return this.attach(record, deadlineMs);
@@ -347,7 +388,10 @@ export class CallService {
 					callId: req.callId,
 					dispatchId: admission.dispatchId,
 				});
-				if (!(await this.submitPending(req.callId))) void this.submitObservations(req.callId);
+				if (!(await this.submitPending(scope))) void this.submitObservations(scope);
+			} else {
+				// Recorded meanwhile: attached only as the identity it was recorded for.
+				this.reentry(principal, lost.record, req, contentDigest);
 			}
 			return this.attach(lost.record, deadlineMs);
 		}
@@ -359,9 +403,14 @@ export class CallService {
 		let version = created.version;
 		if (!created.created) {
 			// A duplicate on another instance recorded the lost permission
-			// before this answer arrived; the permission holder's state wins.
-			record = { ...record, ...base, revision: record.revision, createdAt: record.createdAt };
-			version = await this.writeRecord(record, version);
+			// before this answer arrived: the permission holder takes that
+			// placeholder over — only the placeholder, and only under the
+			// identity it was recorded for. Anything else recorded under this
+			// scope is never overwritten.
+			const taken = await this.takeOver(principal, created.record, created.version, base, req, contentDigest);
+			if (!taken) return this.attach(created.record, deadlineMs);
+			record = taken.record;
+			version = taken.version;
 		}
 		const live = this.startSend(record, version, route, req, deadlineMs);
 		return this.attachLive(live);
@@ -383,6 +432,68 @@ export class CallService {
 				denialErrorCode(record.errorCode ?? "FORBIDDEN"),
 				`Control denied the call: ${record.errorCode}`,
 			);
+		}
+	}
+
+	/**
+	 * The permission holder's take-over of the PERMISSION_LOST placeholder a
+	 * duplicate recorded under the same identity (caller, tenant, digests
+	 * and dispatch): the record moves to `sending` under a conditional
+	 * write and the send proceeds. A record of another identity is refused
+	 * as a reentry would refuse it; a record of this identity that is not
+	 * the placeholder (a send or an outcome already recorded) is kept and
+	 * attached to — this permission goes unexercised rather than a second
+	 * record or a second send being made.
+	 */
+	private async takeOver(
+		principal: Principal,
+		found: CallRecord,
+		foundVersion: string,
+		base: CallRecord,
+		req: ModelCallRequest,
+		contentDigest: string,
+	): Promise<{ record: CallRecord; version: string } | undefined> {
+		let record = found;
+		let version = foundVersion;
+		for (;;) {
+			try {
+				this.reentry(principal, record, req, contentDigest);
+			} catch (err) {
+				this.d.log.error("permission granted for a call recorded under another identity; nothing is sent", {
+					callId: base.callId,
+					dispatchId: base.dispatchId,
+					recordedDispatchId: record.dispatchId,
+				});
+				throw err;
+			}
+			const placeholder =
+				record.state === "unknown" && record.errorCode === "PERMISSION_LOST" && record.evidenceRef === undefined;
+			if (!placeholder || record.dispatchId !== base.dispatchId) {
+				this.d.log.error("permission granted for a call already recorded under its identity; nothing is sent", {
+					callId: base.callId,
+					dispatchId: base.dispatchId,
+					recordedDispatchId: record.dispatchId,
+					state: record.state,
+				});
+				return undefined;
+			}
+			const next: CallRecord = {
+				...record,
+				...base,
+				revision: record.revision,
+				createdAt: record.createdAt,
+				observations: record.observations,
+			};
+			try {
+				version = await this.writeRecord(next, version);
+				return { record: next, version };
+			} catch (err) {
+				if (!(err instanceof PreconditionFailed)) throw err;
+				const again = await this.d.store.read(scopeOf(base));
+				if (!again) throw new CallError("DEPENDENCY_UNAVAILABLE", `call ${base.callId}: the record disappeared`, true);
+				record = again.record;
+				version = again.version;
+			}
 		}
 	}
 
@@ -428,10 +539,10 @@ export class CallService {
 		);
 	}
 
-	private async awaitRecord(callId: string, maxMs: number): Promise<CallRecord | undefined> {
+	private async awaitRecord(scope: CallScope, maxMs: number): Promise<CallRecord | undefined> {
 		const until = this.now() + maxMs;
 		for (;;) {
-			const r = await this.d.store.read(callId);
+			const r = await this.d.store.read(scope);
 			if (r) return r.record;
 			if (this.now() >= until) return undefined;
 			await sleep(this.pollMs);
@@ -446,7 +557,7 @@ export class CallService {
 			return { record, version, created: true };
 		} catch (err) {
 			if (!(err instanceof PreconditionFailed)) throw err;
-			const found = await this.d.store.read(record.callId);
+			const found = await this.d.store.read(scopeOf(record));
 			if (!found) throw err;
 			return { record: found.record, version: found.version, created: false };
 		}
@@ -493,20 +604,21 @@ export class CallService {
 		deadlineMs: number,
 	): LiveCall {
 		const abort = new AbortController();
+		const scope = scopeOf(record);
 		const live: LiveCall = {
-			callId: record.callId,
+			scope,
 			frames: [],
 			subscribers: new Set(),
 			abort,
 			done: Promise.resolve(),
 		};
-		this.live.set(record.callId, live);
+		this.live.set(keyOf(scope), live);
 		live.done = this.runSend(live, record, version, route, req, deadlineMs)
 			.catch((err) => {
 				this.d.log.error("send failed outside the protocol path", { callId: record.callId, error: String(err) });
 			})
 			.finally(() => {
-				this.live.delete(record.callId);
+				this.live.delete(keyOf(scope));
 				this.broadcast(live, null);
 			});
 		return live;
@@ -525,6 +637,7 @@ export class CallService {
 		req: ModelCallRequest,
 		deadlineMs: number,
 	): Promise<void> {
+		const scope = live.scope;
 		const startedAt = this.now();
 		const credential = this.d.cfg.credentials.get(route.id) ?? "";
 		const ticket = new SendTicket(record.callId, route.baseUrl, credential, route.limits.maxEvidenceBytes);
@@ -544,7 +657,7 @@ export class CallService {
 		// Cancellation is durable intent: a cancel that reached another
 		// instance is seen by the sender through the store.
 		const cancelPoll = setInterval(() => {
-			void this.d.store.cancelRequested(record.callId).then((at) => {
+			void this.d.store.cancelRequested(scope).then((at) => {
 				if (at && !live.abort.signal.aborted) {
 					live.cancelReason ??= "cancel";
 					live.abort.abort();
@@ -555,7 +668,7 @@ export class CallService {
 		try {
 			// A cancel that reached the store before the first byte leaves is
 			// honored without a send.
-			if (!live.abort.signal.aborted && (await this.d.store.cancelRequested(record.callId))) {
+			if (!live.abort.signal.aborted && (await this.d.store.cancelRequested(scope))) {
 				live.cancelReason ??= "cancel";
 				live.abort.abort();
 			}
@@ -605,6 +718,7 @@ export class CallService {
 		const settlement = this.settle(live, ticket, upstreamError, frames, record.callId);
 		const evidence: NativeEvidence = {
 			callId: record.callId,
+			tenantId: record.tenantId,
 			dispatchId: record.dispatchId,
 			routeId: route.id,
 			capturedAt: timestamp(this.now()),
@@ -632,19 +746,22 @@ export class CallService {
 			refusedSends: ticket.refused.length,
 			durationMs: this.now() - startedAt,
 		});
-		// Durable order: the evidence with its settlement, then the record with
-		// the pending observation, then the observation itself. Nothing is
-		// reported that is not recorded, and nothing unrecorded is handed to
-		// the callers: while the store does not take the settlement, the
-		// callers wait (their own bounds end the wait; a reentry finds the
-		// record still sending) and the settlement is retried here; lost with
-		// this process, the evidence — once written — lets the sweep complete
-		// it, and without evidence the sweep reclaims the send as unknown.
+		// Durable order: the evidence with its settlement, then the pending
+		// marker again (a sweep that reclaimed this send meanwhile may have
+		// released it; from here on any instance discovers the evidence and
+		// completes the settlement should this process be lost), then the
+		// record with the pending observation, then the observation itself.
+		// Nothing is reported that is not recorded, and nothing unrecorded is
+		// handed to the callers: while the store does not take the
+		// settlement, the callers wait (their own bounds end the wait; a
+		// reentry finds the record still sending) and the settlement is
+		// retried here; without evidence the sweep reclaims the send as unknown.
 		let delay = this.d.cfg.observation.retryInitialMs;
 		for (;;) {
 			try {
 				const evidenceRef = await this.d.store.writeEvidence(evidence);
-				await this.publish(record.callId, settlement, evidenceRef);
+				await this.d.store.markPending(scope, record.deadline);
+				await this.publish(scope, settlement, evidenceRef, record.dispatchId);
 				break;
 			} catch (err) {
 				this.d.log.error("settlement not persisted; retrying, the callers wait", {
@@ -661,7 +778,7 @@ export class CallService {
 		// stream ends (the ledger sees the outcome the caller is handed);
 		// an unavailable Control is retried in the background under the same
 		// identity, and by the sweep after a restart.
-		if (!(await this.submitPending(record.callId))) void this.submitObservations(record.callId);
+		if (!(await this.submitPending(scope))) void this.submitObservations(scope);
 		const last = settlement.frames.at(-1);
 		if (last && (last.type === "done" || last.type === "error")) this.broadcast(live, last);
 	}
@@ -755,13 +872,27 @@ export class CallService {
 	 * sender's settlement landed takes the settlement when it establishes
 	 * more (a definite outcome, or usage), with a supplemental observation
 	 * under a fresh sequence — Control corrects its ledger from it and never
-	 * charges the same cumulative usage twice.
+	 * charges the same cumulative usage twice. The settlement is bound to the
+	 * dispatch it was made under: a record of another dispatch never takes it.
 	 */
-	private async publish(callId: string, settlement: Settlement, evidenceRef: string): Promise<void> {
+	private async publish(
+		scope: CallScope,
+		settlement: Settlement,
+		evidenceRef: string,
+		dispatchId: string,
+	): Promise<void> {
 		for (;;) {
-			const found = await this.d.store.read(callId);
-			if (!found) throw new Error(`call ${callId} has no record to settle`);
+			const found = await this.d.store.read(scope);
+			if (!found) throw new Error(`call ${scope.callId} has no record to settle`);
 			const rec = found.record;
+			if (rec.dispatchId !== dispatchId) {
+				this.d.log.error("settlement of another dispatch refused; the record is kept", {
+					callId: scope.callId,
+					dispatchId,
+					recordedDispatchId: rec.dispatchId,
+				});
+				return;
+			}
 			if (rec.evidenceRef === evidenceRef && rec.state === settlement.outcome) return;
 			let observe = true;
 			if (isTerminal(rec.state)) {
@@ -770,7 +901,7 @@ export class CallService {
 				if (settlement.outcome === "unknown" && !settlement.usage) observe = false;
 				else {
 					this.d.log.warn("the sender's settlement supersedes the reclaimed unknown outcome", {
-						callId,
+						callId: scope.callId,
 						dispatchId: rec.dispatchId,
 						outcome: settlement.outcome,
 					});
@@ -795,7 +926,7 @@ export class CallService {
 				return;
 			} catch (err) {
 				if (!(err instanceof PreconditionFailed)) throw err;
-				this.d.log.info("record moved during settlement; reapplying", { callId });
+				this.d.log.info("record moved during settlement; reapplying", { callId: scope.callId });
 			}
 		}
 	}
@@ -810,7 +941,7 @@ export class CallService {
 			wake?.();
 		};
 		live.subscribers.add(push);
-		const closedAlready = !this.live.has(live.callId);
+		const closedAlready = !this.live.has(keyOf(live.scope));
 		if (closedAlready) queue.push(null);
 		return (async function* () {
 			try {
@@ -834,7 +965,8 @@ export class CallService {
 
 	/** Replays a recorded call; a send owned elsewhere is awaited through the store until it is terminal or reclaimable. */
 	private attach(record: CallRecord, deadlineMs: number): AsyncGenerator<StreamFrame> {
-		const live = this.live.get(record.callId);
+		const scope = scopeOf(record);
+		const live = this.live.get(keyOf(scope));
 		if (live) return this.attachLive(live);
 		const self = this;
 		return (async function* () {
@@ -843,10 +975,10 @@ export class CallService {
 			while (!isTerminal(current.state)) {
 				if (self.now() > until) break;
 				await sleep(self.pollMs);
-				const again = await self.d.store.read(current.callId);
+				const again = await self.d.store.read(scope);
 				if (!again) break;
 				current = again.record;
-				const nowLive = self.live.get(current.callId);
+				const nowLive = self.live.get(keyOf(scope));
 				if (nowLive) {
 					yield* self.attachLive(nowLive);
 					return;
@@ -860,18 +992,19 @@ export class CallService {
 
 	/** The record's public view, for its caller or a trusted Control query; nobody else learns whether the call exists. */
 	async get(principal: Principal, callId: string): Promise<ModelCall> {
-		const found = await this.d.store.read(callId);
-		if (!found || !this.canRead(principal, found.record)) throw new CallError("NOT_FOUND", `no call ${callId}`);
+		const found = await this.resolve(principal, callId, false);
+		if (!found) throw new CallError("NOT_FOUND", `no call ${callId}`);
 		return toModelCall(found.record);
 	}
 
 	/** Records the caller's cancel intent durably and aborts a send this process owns; incurred usage stays. */
 	async cancel(principal: Principal, callId: string): Promise<ModelCall> {
-		const found = await this.d.store.read(callId);
-		if (!found || !this.isOwner(principal, found.record)) throw new CallError("NOT_FOUND", `no call ${callId}`);
+		const found = await this.resolve(principal, callId, true);
+		if (!found) throw new CallError("NOT_FOUND", `no call ${callId}`);
+		const scope = scopeOf(found.record);
 		const at = timestamp(this.now());
-		await this.d.store.requestCancel(callId, at);
-		const live = this.live.get(callId);
+		await this.d.store.requestCancel(scope, at);
+		const live = this.live.get(keyOf(scope));
 		if (live && !live.abort.signal.aborted) {
 			live.cancelReason ??= "cancel";
 			live.abort.abort();
@@ -885,24 +1018,44 @@ export class CallService {
 				if (!(err instanceof PreconditionFailed)) throw err;
 			}
 		}
-		const after = await this.d.store.read(callId);
+		const after = await this.d.store.read(scope);
 		return toModelCall(after?.record ?? rec);
 	}
 
 	// ---- observations, retries and the sweep ----------------------------------
 
 	/**
+	 * Whether the pending marker of a record may go: nothing more can arrive
+	 * for a record settled from its evidence (evidence is written once), for
+	 * a denied call or for a lost permission (no send was made under the
+	 * record); a send reclaimed without evidence keeps its marker for the
+	 * late-settlement window after the reclaim, so the evidence its lost
+	 * sender persisted after the reclaim is still completed from; a send
+	 * still recorded as sending keeps it.
+	 */
+	private releasable(rec: CallRecord): boolean {
+		if (rec.evidenceRef !== undefined) return true;
+		if (rec.state === "denied" || rec.errorCode === "PERMISSION_LOST") return true;
+		if (rec.reclaimedAt !== undefined) {
+			const at = Date.parse(rec.reclaimedAt);
+			return Number.isNaN(at) || this.now() > at + this.d.cfg.observation.lateSettlementWindowMs;
+		}
+		return false;
+	}
+
+	/**
 	 * One pass over the unsubmitted observations of the call, each under its
 	 * recorded source and sequence. Returns true when nothing is pending
-	 * afterwards (the marker is cleared), false when Control did not answer.
+	 * afterwards (the marker is released when nothing more can arrive), false
+	 * when Control did not answer.
 	 */
-	async submitPending(callId: string): Promise<boolean> {
+	async submitPending(scope: CallScope): Promise<boolean> {
 		for (;;) {
-			const found = await this.d.store.read(callId);
+			const found = await this.d.store.read(scope);
 			if (!found) return true;
 			const pending = found.record.observations.filter((o) => !o.submitted);
 			if (pending.length === 0) {
-				await this.d.store.clearPending(callId);
+				if (this.releasable(found.record)) await this.d.store.clearPending(scope);
 				return true;
 			}
 			let failed: unknown;
@@ -919,7 +1072,7 @@ export class CallService {
 					});
 					o.submitted = true;
 					this.d.log.info("observation recorded", {
-						callId,
+						callId: scope.callId,
 						dispatchId: found.record.dispatchId,
 						source: o.source,
 						sequence: o.sequence,
@@ -934,7 +1087,7 @@ export class CallService {
 						// repeated; the refusal is diagnostic.
 						o.submitted = true;
 						this.d.log.warn("observation refused by Control", {
-							callId,
+							callId: scope.callId,
 							dispatchId: found.record.dispatchId,
 							code: err.code,
 							sequence: o.sequence,
@@ -953,7 +1106,7 @@ export class CallService {
 			}
 			if (failed) {
 				this.d.log.warn("observation not answered; it stays pending under the same identity", {
-					callId,
+					callId: scope.callId,
 					error: String(failed),
 				});
 				return false;
@@ -962,31 +1115,34 @@ export class CallService {
 	}
 
 	/** Retries submitPending with backoff until nothing is pending or the service closes. */
-	async submitObservations(callId: string): Promise<void> {
-		if (this.retrying.has(callId)) return;
-		this.retrying.add(callId);
+	async submitObservations(scope: CallScope): Promise<void> {
+		const key = keyOf(scope);
+		if (this.retrying.has(key)) return;
+		this.retrying.add(key);
 		try {
 			let delay = this.d.cfg.observation.retryInitialMs;
-			while (!(await this.submitPending(callId))) {
+			while (!(await this.submitPending(scope))) {
 				if (this.closing) return;
 				await sleep(delay);
 				delay = Math.min(delay * 2, this.d.cfg.observation.retryMaxIntervalMs);
 			}
 		} finally {
-			this.retrying.delete(callId);
+			this.retrying.delete(key);
 		}
 	}
 
 	/**
 	 * The sweep over the pending markers: resubmits pending observations
-	 * (idempotent by identity); completes a send still recorded as sending
-	 * whose evidence carries its settlement (the sender persisted the
-	 * evidence and was lost before the record took it — the original
-	 * settlement, never a resend); reclaims a send whose deadline plus grace
-	 * passed without evidence as unknown — the permission was consumed,
-	 * whether bytes left is not known, so the exposure stays until
-	 * independently checkable evidence resolves it. A marker without a record
-	 * is cleared once the call's deadline plus grace passed (its opener wrote
+	 * (idempotent by identity); completes a record whose evidence carries a
+	 * settlement the record has not taken — the sender persisted the evidence
+	 * and was lost before the record took it, whether the record still says
+	 * sending or a sweep had already reclaimed it as unknown (the original
+	 * settlement of the same dispatch, never a resend); reclaims a send whose
+	 * deadline plus grace passed without evidence as unknown — the permission
+	 * was consumed, whether bytes left is not known, so the exposure stays
+	 * until independently checkable evidence resolves it — and keeps the
+	 * marker for the late-settlement window. A marker without a record is
+	 * cleared once the call's deadline plus grace passed (its opener wrote
 	 * the marker first and died before the record). A send this process owns
 	 * is never touched.
 	 */
@@ -995,59 +1151,70 @@ export class CallService {
 		let reclaimed = 0;
 		let completed = 0;
 		const grace = this.d.cfg.observation.reclaimGraceMs;
-		for (const callId of await this.d.store.listPending()) {
-			if (this.live.has(callId)) continue;
-			const found = await this.d.store.read(callId);
+		for (const scope of await this.d.store.listPending()) {
+			if (this.live.has(keyOf(scope))) continue;
+			const found = await this.d.store.read(scope);
 			if (!found) {
-				const marker = await this.d.store.readPending(callId);
+				const marker = await this.d.store.readPending(scope);
 				const deadlineMs = marker?.deadline ? Date.parse(marker.deadline) : Number.NaN;
-				if (Number.isNaN(deadlineMs) || this.now() > deadlineMs + grace) await this.d.store.clearPending(callId);
+				if (Number.isNaN(deadlineMs) || this.now() > deadlineMs + grace) await this.d.store.clearPending(scope);
 				continue;
 			}
 			let rec = found.record;
-			if (rec.state === "sending") {
-				const evidence = await this.d.store.readEvidence(callId);
-				if (evidence?.settlement) {
-					await this.publish(callId, evidence.settlement, `evidence/${callId}`);
-					this.d.log.warn("settlement completed from the evidence: the sender did not finish its record", {
-						callId,
-						dispatchId: rec.dispatchId,
-						outcome: evidence.settlement.outcome,
-					});
-					completed++;
-				} else {
-					const deadlineMs = Date.parse(rec.deadline);
-					if (this.now() <= deadlineMs + grace) continue;
-					rec.state = "unknown";
-					rec.errorCode = "SENDER_LOST";
-					const route = this.d.cfg.routes.find((r) => r.id === rec.routeId);
-					rec.frames = this.staticFrames(
-						rec.callId,
-						route ?? ({ limits: { maxFrameBytes: 65536, maxOutputBytes: 1, maxFrames: 2 } } as Route),
-						(f) => f.error("unknown", "SENDER_LOST"),
-					);
-					rec.observations.push(this.observationOf(rec, "unknown", undefined, undefined));
-					try {
-						await this.writeRecord(rec, found.version);
-					} catch (err) {
-						if (err instanceof PreconditionFailed) continue;
-						throw err;
-					}
-					this.d.log.warn("send reclaimed as unknown: the sender did not finish before the deadline", {
-						callId,
-						dispatchId: rec.dispatchId,
-					});
-					reclaimed++;
-				}
-				const again = await this.d.store.read(callId);
-				if (!again) continue;
-				rec = again.record;
+			const evidenceKey = evidenceKeyOf(scope);
+			const evidence = await this.d.store.readEvidence(scope);
+			// Evidence settles the record it was made for: the same dispatch.
+			const settlement =
+				evidence?.settlement && evidence.dispatchId === rec.dispatchId ? evidence.settlement : undefined;
+			if (evidence?.settlement && !settlement) {
+				this.d.log.error("evidence of another dispatch under the call's scope; not applied", {
+					callId: scope.callId,
+					dispatchId: rec.dispatchId,
+					evidenceDispatchId: evidence.dispatchId,
+				});
 			}
+			if (settlement && rec.evidenceRef !== evidenceKey && rec.state !== "denied") {
+				await this.publish(scope, settlement, evidenceKey, rec.dispatchId);
+				this.d.log.warn("settlement completed from the evidence: the sender did not finish its record", {
+					callId: scope.callId,
+					dispatchId: rec.dispatchId,
+					outcome: settlement.outcome,
+					reclaimed: rec.reclaimedAt !== undefined,
+				});
+				completed++;
+			} else if (rec.state === "sending") {
+				const deadlineMs = Date.parse(rec.deadline);
+				if (this.now() <= deadlineMs + grace) continue;
+				rec.state = "unknown";
+				rec.errorCode = "SENDER_LOST";
+				rec.reclaimedAt = timestamp(this.now());
+				const route = this.d.cfg.routes.find((r) => r.id === rec.routeId);
+				rec.frames = this.staticFrames(
+					rec.callId,
+					route ?? ({ limits: { maxFrameBytes: 65536, maxOutputBytes: 1, maxFrames: 2 } } as Route),
+					(f) => f.error("unknown", "SENDER_LOST"),
+				);
+				rec.observations.push(this.observationOf(rec, "unknown", undefined, undefined));
+				try {
+					await this.writeRecord(rec, found.version);
+				} catch (err) {
+					if (err instanceof PreconditionFailed) continue;
+					throw err;
+				}
+				this.d.log.warn("send reclaimed as unknown: the sender did not finish before the deadline", {
+					callId: scope.callId,
+					dispatchId: rec.dispatchId,
+				});
+				reclaimed++;
+			}
+			const again = await this.d.store.read(scope);
+			if (!again) continue;
+			rec = again.record;
 			if (rec.observations.some((o) => !o.submitted)) {
 				resubmitted++;
-				void this.submitObservations(callId);
-			} else {
-				await this.d.store.clearPending(callId);
+				void this.submitObservations(scope);
+			} else if (this.releasable(rec)) {
+				await this.d.store.clearPending(scope);
 			}
 		}
 		return { resubmitted, reclaimed, completed };
