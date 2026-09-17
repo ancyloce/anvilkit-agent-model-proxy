@@ -1,0 +1,15 @@
+# Only the package manifests, the sources and the reviewed configuration
+# enter the image build.
+.git
+.github
+.local
+node_modules
+dist
+deploy
+test
+README.md
+LICENSE
+Dockerfile
+.dockerignore
+biome.json
+vitest.config.ts
