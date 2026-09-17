@@ -1,0 +1,21 @@
+# This directory is its own pnpm workspace root (one package), independent of
+# the parent's workspace globs, as contracts/ and jobs/validator are: the
+# lockfile here pins the Proxy's toolchain and the exact contracts commit it
+# consumes (@anvilkit/generated-clients as a git-hosted dependency of the
+# contracts repository, resolved by commit hash and content integrity).
+packages: []
+# No lifecycle script runs in this install (the trusted side): esbuild's
+# postinstall only fetches a platform binary when its optional platform
+# package is absent, and the locked optional package is present; protobufjs
+# (transitive of @grpc/grpc-js) only prints a notice; @google/genai
+# (transitive of pi-ai, a provider path this build does not enable) has a
+# no-op preinstall echo.
+allowBuilds:
+  '@google/genai': false
+  esbuild: false
+  protobufjs: false
+# pnpm's minimum-release-age policy: the exclusions pnpm recorded for the
+# pinned versions younger than its default window at install time.
+minimumReleaseAgeExclude:
+  - '@types/node@24.13.5'
+  - '@aws-sdk/client-s3@3.1134.0'
