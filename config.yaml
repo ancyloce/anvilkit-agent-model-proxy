@@ -55,11 +55,15 @@ observation:
   # ObserveDispatch resubmission of a recorded observation under its original
   # source and sequence; the sweep resubmits pending observations and
   # reclaims a send whose deadline plus grace passed without evidence as
-  # unknown (never as sent-nothing, never by resending).
+  # unknown (never as sent-nothing, never by resending). A reclaimed call's
+  # pending marker stays for the late-settlement window, so evidence the
+  # lost sender persisted after the reclaim is still completed from — the
+  # original settlement and usage, one supplemental observation, no send.
   retry_initial: 1s
   retry_max_interval: 30s
   sweep_interval: 30s
   reclaim_grace: 30s
+  late_settlement_window: 1h
 # routes: the reviewed model routes. A route is served only when it is
 # enabled here, its credential variable is set, and its api is one of the
 # implemented and inspected SDK paths (openai-completions in this build).
@@ -95,3 +99,12 @@ routes:
           additionalProperties: false
           properties:
             section: { type: string, maxLength: 64 }
+      # The structured outputs of the Preparation analysis (P13-02): the
+      # Workflow's AnalyzeRequirements Activity names these tools by the
+      # canonical digest of exactly these schemas (activities/lifecycle.go).
+      - name: submit_requirements
+        description: Submits the structured requirements of the requested component.
+        input_schema: {"type":"object","additionalProperties":false,"required":["componentName","packageName","purpose","content","interaction","editableFields","constraints","acceptance","unknowns"],"properties":{"componentName":{"type":"string","pattern":"^[A-Z][A-Za-z0-9]{0,63}$"},"packageName":{"type":"string","pattern":"^(@[a-z0-9-]+/)?[a-z0-9][a-z0-9._-]{0,212}$"},"purpose":{"type":"string","minLength":1,"maxLength":2000},"content":{"type":"string","minLength":1,"maxLength":8000},"interaction":{"type":"string","maxLength":4000},"editableFields":{"type":"array","maxItems":32,"items":{"type":"object","additionalProperties":false,"required":["name","type"],"properties":{"name":{"type":"string","minLength":1,"maxLength":64},"type":{"type":"string","enum":["text","richtext","image","link","number","boolean","color"]},"default":{"type":"string","maxLength":2000}}}},"constraints":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":1000}},"acceptance":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":1000}},"unknowns":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":1000}}}}
+      - name: ask_questions
+        description: Asks at most three grouped clarification questions when the request is insufficient.
+        input_schema: {"type":"object","additionalProperties":false,"required":["questions"],"properties":{"questions":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"object","additionalProperties":false,"required":["id","text"],"properties":{"id":{"type":"string","pattern":"^q[1-9]$"},"text":{"type":"string","minLength":1,"maxLength":2000}}}}}}
