@@ -1,0 +1,97 @@
+# anvilkit-agent-model-proxy configuration (reviewed, secret-free). Loaded by
+# src/config.ts with precedence defaults < this file < the allowlisted
+# environment overrides: ANVILKIT_MODEL_PROXY_LISTEN,
+# ANVILKIT_MODEL_PROXY_CONTROL_ADDRESS, ANVILKIT_MODEL_PROXY_PRINCIPALS_FILE
+# (the DEVELOPMENT_ONLY bearer principals of identity.mode development),
+# ANVILKIT_MODEL_PROXY_STORE_DIR (filesystem backend),
+# ANVILKIT_MODEL_PROXY_STORE_S3_{ENDPOINT,BUCKET,ACCESS_KEY_ID,SECRET_ACCESS_KEY}
+# (s3 backend; the key pair is a secret), ANVILKIT_MODEL_PROXY_CONTRACTS_DIR
+# and the route credentials ANVILKIT_MODEL_PROXY_CREDENTIAL_<NAME> that the
+# routes below declare. Unknown keys and any other ANVILKIT_MODEL_PROXY_*
+# variable fail startup. Provider credentials, principals, store placements
+# and the contracts directory are refused inside this file. With
+# identity.mode disabled (the default) the process exits before listening.
+http:
+  listen: 127.0.0.1:9103
+  max_body_bytes: 4194304
+  request_header_timeout: 10s
+  sse_heartbeat: 15s
+  slow_consumer_grace: 10s
+  shutdown_timeout: 20s
+identity:
+  # disabled | development (bearer principals file, DEVELOPMENT_ONLY) | mtls
+  # (client certificates of the workload identity, ENV-03; principals map a
+  # certificate common name to the caller kind).
+  mode: disabled
+  # owner is the sender identity recorded on Control's dispatch records
+  # (AdmitModel owner); the authenticated caller is the command actor.
+  owner: anvilkit-agent-model-proxy
+  mtls:
+    principals: []
+control:
+  address: 127.0.0.1:9101
+  timeout: 15s
+  # identity.mode development is the plaintext gRPC of the development
+  # foundation and qualifies nothing; mtls names the client certificate files.
+  identity:
+    mode: development
+  # A lost admission response is retried under the same call identity only
+  # (Control answers the recorded decision, never a second permission).
+  admission_retry:
+    initial: 500ms
+    max_interval: 5s
+    max_attempts: 5
+store:
+  # filesystem (DEVELOPMENT_ONLY; dir from ANVILKIT_MODEL_PROXY_STORE_DIR) or
+  # s3 (an S3-compatible bucket with its own credentials, the chart's backend;
+  # qualify_on_start proves conditional create/replace before serving).
+  backend: filesystem
+  s3:
+    region: default
+    prefix: model-proxy
+    path_style: true
+    qualify_on_start: true
+observation:
+  # ObserveDispatch resubmission of a recorded observation under its original
+  # source and sequence; the sweep resubmits pending observations and
+  # reclaims a send whose deadline plus grace passed without evidence as
+  # unknown (never as sent-nothing, never by resending).
+  retry_initial: 1s
+  retry_max_interval: 30s
+  sweep_interval: 30s
+  reclaim_grace: 30s
+# routes: the reviewed model routes. A route is served only when it is
+# enabled here, its credential variable is set, and its api is one of the
+# implemented and inspected SDK paths (openai-completions in this build).
+# Prices, caps and commercial authority stay with Control (ENV-06/ENV-07);
+# limits here bound what one call may declare or receive on the route.
+# controlled-openai-v1 is the countable controlled upstream of the P11
+# scenarios (an OpenAI-compatible completions double); it is enabled only by
+# the scenarios' own configuration copies. No real provider route exists in
+# this build: a real route needs explicit model, data, price, cap and
+# invocation authorization before it is declared.
+routes:
+  - id: controlled-openai-v1
+    enabled: false
+    api: openai-completions
+    provider: fixture
+    model: fixture-model
+    base_url: http://127.0.0.1:1/v1
+    credential_env: ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1
+    limits:
+      max_output_tokens: 4096
+      max_exposure: { currency: USD, amount: "1000000" }
+      max_deadline: 10m
+      max_frame_bytes: 65536
+      max_output_bytes: 1048576
+      max_frames: 4096
+      upstream_timeout: 5m
+      max_evidence_bytes: 4194304
+    tools:
+      - name: read_brief
+        description: Reads the frozen brief.
+        input_schema:
+          type: object
+          additionalProperties: false
+          properties:
+            section: { type: string, maxLength: 64 }
