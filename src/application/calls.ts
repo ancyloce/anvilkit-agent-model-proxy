@@ -439,9 +439,13 @@ export class CallService {
 	 * The permission holder's take-over of the PERMISSION_LOST placeholder a
 	 * duplicate recorded under the same identity (caller, tenant, digests
 	 * and dispatch): the record moves to `sending` under a conditional
-	 * write and the send proceeds. A record of another identity is refused
-	 * as a reentry would refuse it; a record of this identity that is not
-	 * the placeholder (a send or an outcome already recorded) is kept and
+	 * write — the placeholder's error code, frames and any other outcome
+	 * state are dropped, its observations (submitted or not) are kept — and
+	 * the pending marker is written again, since the duplicate may already
+	 * have submitted its unknown observation and released the marker; then
+	 * the send proceeds. A record of another identity is refused as a
+	 * reentry would refuse it; a record of this identity that is not the
+	 * placeholder (a send or an outcome already recorded) is kept and
 	 * attached to — this permission goes unexercised rather than a second
 	 * record or a second send being made.
 	 */
@@ -478,14 +482,16 @@ export class CallService {
 				return undefined;
 			}
 			const next: CallRecord = {
-				...record,
 				...base,
 				revision: record.revision,
 				createdAt: record.createdAt,
+				updatedAt: record.updatedAt,
 				observations: record.observations,
 			};
+			if (record.cancelRequestedAt) next.cancelRequestedAt = record.cancelRequestedAt;
 			try {
 				version = await this.writeRecord(next, version);
+				await this.d.store.markPending(scopeOf(base), base.deadline);
 				return { record: next, version };
 			} catch (err) {
 				if (!(err instanceof PreconditionFailed)) throw err;
@@ -748,9 +754,9 @@ export class CallService {
 		});
 		// Durable order: the evidence with its settlement, then the pending
 		// marker again (a sweep that reclaimed this send meanwhile may have
-		// released it; from here on any instance discovers the evidence and
-		// completes the settlement should this process be lost), then the
-		// record with the pending observation, then the observation itself.
+		// released it — the reclaimed index still finds the evidence, the
+		// marker just makes it the next pass), then the record with the
+		// pending observation, then the observation itself.
 		// Nothing is reported that is not recorded, and nothing unrecorded is
 		// handed to the callers: while the store does not take the
 		// settlement, the callers wait (their own bounds end the wait; a
@@ -1025,22 +1031,41 @@ export class CallService {
 	// ---- observations, retries and the sweep ----------------------------------
 
 	/**
-	 * Whether the pending marker of a record may go: nothing more can arrive
-	 * for a record settled from its evidence (evidence is written once), for
-	 * a denied call or for a lost permission (no send was made under the
-	 * record); a send reclaimed without evidence keeps its marker for the
-	 * late-settlement window after the reclaim, so the evidence its lost
-	 * sender persisted after the reclaim is still completed from; a send
-	 * still recorded as sending keeps it.
+	 * Whether the pending marker of a record may go: nothing more is owed
+	 * through it for a record settled from its evidence (evidence is written
+	 * once), for a denied call, for a lost permission once the call's
+	 * deadline plus the reclaim grace passed (until then the permission
+	 * holder may still take the placeholder over, and the marker must outlive
+	 * that), and for a send reclaimed as unknown (its lost sender's evidence
+	 * is watched through the `reclaimed` index, not through this marker); a
+	 * send still recorded as sending keeps it.
 	 */
 	private releasable(rec: CallRecord): boolean {
 		if (rec.evidenceRef !== undefined) return true;
-		if (rec.state === "denied" || rec.errorCode === "PERMISSION_LOST") return true;
-		if (rec.reclaimedAt !== undefined) {
-			const at = Date.parse(rec.reclaimedAt);
-			return Number.isNaN(at) || this.now() > at + this.d.cfg.observation.lateSettlementWindowMs;
+		if (rec.state === "denied") return true;
+		if (rec.errorCode === "PERMISSION_LOST") {
+			return this.now() > Date.parse(rec.deadline) + this.d.cfg.observation.reclaimGraceMs;
 		}
-		return false;
+		return rec.errorCode === "SENDER_LOST";
+	}
+
+	/**
+	 * Releases the pending marker of a record nothing more is owed through
+	 * (a reclaimed send is indexed first, so its evidence stays watched), then
+	 * reads the record again: a take-over or a settlement that landed while
+	 * the decision was made — an active send, an observation to submit —
+	 * writes the marker back, so a delete decided on a stale record hides
+	 * nothing.
+	 */
+	private async release(scope: CallScope, rec: CallRecord): Promise<void> {
+		if (rec.errorCode === "SENDER_LOST" && rec.evidenceRef === undefined) await this.d.store.markReclaimed(scope);
+		await this.d.store.clearPending(scope);
+		const again = await this.d.store.read(scope);
+		if (!again) return;
+		const now = again.record;
+		if (now.state === "sending" || now.observations.some((o) => !o.submitted) || !this.releasable(now)) {
+			await this.d.store.markPending(scope, now.deadline);
+		}
 	}
 
 	/**
@@ -1055,7 +1080,7 @@ export class CallService {
 			if (!found) return true;
 			const pending = found.record.observations.filter((o) => !o.submitted);
 			if (pending.length === 0) {
-				if (this.releasable(found.record)) await this.d.store.clearPending(scope);
+				if (this.releasable(found.record)) await this.release(scope, found.record);
 				return true;
 			}
 			let failed: unknown;
@@ -1140,19 +1165,27 @@ export class CallService {
 	 * settlement of the same dispatch, never a resend); reclaims a send whose
 	 * deadline plus grace passed without evidence as unknown — the permission
 	 * was consumed, whether bytes left is not known, so the exposure stays
-	 * until independently checkable evidence resolves it — and keeps the
-	 * marker for the late-settlement window. A marker without a record is
-	 * cleared once the call's deadline plus grace passed (its opener wrote
-	 * the marker first and died before the record). A send this process owns
-	 * is never touched.
+	 * until independently checkable evidence resolves it — and indexes it
+	 * under `reclaimed`. A marker without a record is cleared once the call's
+	 * deadline plus grace passed (its opener wrote the marker first and died
+	 * before the record). Then the sweep over the reclaimed index: a lost
+	 * sender's evidence that landed after the marker went — the sender gone
+	 * before it could write the marker back or publish — is completed from
+	 * exactly as above, and an entry is removed only once the record took its
+	 * evidence and owes no observation (evidence is written once: nothing can
+	 * follow), so no marker delete ever hides a settlement; an entry without
+	 * evidence is watched, one read per pass, for as long as it takes. A send
+	 * this process owns is never touched.
 	 */
 	async sweep(): Promise<{ resubmitted: number; reclaimed: number; completed: number }> {
 		let resubmitted = 0;
 		let reclaimed = 0;
 		let completed = 0;
 		const grace = this.d.cfg.observation.reclaimGraceMs;
+		const visited = new Set<string>();
 		for (const scope of await this.d.store.listPending()) {
 			if (this.live.has(keyOf(scope))) continue;
+			visited.add(keyOf(scope));
 			const found = await this.d.store.read(scope);
 			if (!found) {
 				const marker = await this.d.store.readPending(scope);
@@ -1201,6 +1234,7 @@ export class CallService {
 					if (err instanceof PreconditionFailed) continue;
 					throw err;
 				}
+				await this.d.store.markReclaimed(scope);
 				this.d.log.warn("send reclaimed as unknown: the sender did not finish before the deadline", {
 					callId: scope.callId,
 					dispatchId: rec.dispatchId,
@@ -1214,7 +1248,49 @@ export class CallService {
 				resubmitted++;
 				void this.submitObservations(scope);
 			} else if (this.releasable(rec)) {
-				await this.d.store.clearPending(scope);
+				await this.release(scope, rec);
+			}
+		}
+		for (const scope of await this.d.store.listReclaimed()) {
+			if (this.live.has(keyOf(scope)) || visited.has(keyOf(scope))) continue;
+			const evidence = await this.d.store.readEvidence(scope);
+			if (!evidence?.settlement) continue; // still lost: watched, never released
+			const found = await this.d.store.read(scope);
+			if (!found) {
+				await this.d.store.clearReclaimed(scope);
+				continue;
+			}
+			let rec = found.record;
+			const evidenceKey = evidenceKeyOf(scope);
+			if (evidence.dispatchId !== rec.dispatchId) {
+				// Evidence is written once: nothing of this dispatch can follow it.
+				this.d.log.error("evidence of another dispatch under a reclaimed call; the entry is dropped", {
+					callId: scope.callId,
+					dispatchId: rec.dispatchId,
+					evidenceDispatchId: evidence.dispatchId,
+				});
+				await this.d.store.clearReclaimed(scope);
+				continue;
+			}
+			if (rec.evidenceRef !== evidenceKey && rec.state !== "denied") {
+				// The observation this raises is retried through the pending marker.
+				await this.d.store.markPending(scope, rec.deadline);
+				await this.publish(scope, evidence.settlement, evidenceKey, rec.dispatchId);
+				this.d.log.warn("settlement completed from late evidence: the sender did not finish its record", {
+					callId: scope.callId,
+					dispatchId: rec.dispatchId,
+					outcome: evidence.settlement.outcome,
+				});
+				completed++;
+				const again = await this.d.store.read(scope);
+				if (!again) continue;
+				rec = again.record;
+			}
+			if (rec.observations.some((o) => !o.submitted)) {
+				resubmitted++;
+				void this.submitObservations(scope);
+			} else {
+				await this.d.store.clearReclaimed(scope);
 			}
 		}
 		return { resubmitted, reclaimed, completed };
