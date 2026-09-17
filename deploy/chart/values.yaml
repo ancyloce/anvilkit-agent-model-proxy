@@ -122,6 +122,7 @@ config:
     retry_max_interval: 30s
     sweep_interval: 30s
     reclaim_grace: 30s
+    late_settlement_window: 1h
   routes:
     - id: controlled-openai-v1
       enabled: false
