@@ -49,6 +49,22 @@ describe("contract boundary", () => {
 				'{"inputUnits":"1","inputUnits":"2","outputUnits":"0","reasoningUnits":"0","cachedInputUnits":"0"}',
 			),
 		).toThrow(/malformed/);
+		// The shared strict parser of the contracts package decides, equal values included.
+		expect(() =>
+			contract.parse(
+				"Usage",
+				'{"inputUnits":"1","inputUnits":"1","outputUnits":"0","reasoningUnits":"0","cachedInputUnits":"0"}',
+			),
+		).toThrow(/malformed JSON: Duplicate key 'inputUnits'/);
+		expect(() =>
+			contract.parse(
+				"StreamFrame",
+				'{"callId":"c","sequence":"1","type":"usage","usage":{"inputUnits":"1","inputUnits":"1"}}',
+			),
+		).toThrow(/malformed JSON: Duplicate key 'inputUnits'/);
+		expect(() =>
+			contract.parse("StreamFrame", '{"callId":"c","sequence":"0","type":"admitted"} {"callId":"c"}'),
+		).toThrow(/malformed JSON/);
 		expect(() => contract.parse("ModelCallRequest", '{"maxOutputTokens":1e400}')).toThrow(/malformed/);
 		expect(() =>
 			contract.parse("StreamFrame", '{"callId":"c","sequence":"1","type":"text","text":"a","apiKey":"x"}'),

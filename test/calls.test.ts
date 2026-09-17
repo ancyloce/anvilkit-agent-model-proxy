@@ -1,4 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
+import { Agent } from "node:http";
+import type { Socket } from "node:net";
 import path from "node:path";
 import { DispatchOutcome, DispatchState } from "@anvilkit/generated-clients/proto/anvilkit/control/v1/dispatch";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -31,6 +33,8 @@ describe("controlled calls", () => {
 	let proxy: RunningProxy;
 	let n = 0;
 	const id = (name: string) => `call_${name}_${++n}_${Date.now()}`;
+	/** The scope of the scenarios' calls: requestBody binds them to tenant_a. */
+	const scope = (callId: string) => ({ tenantId: "tenant_a", callId });
 
 	beforeAll(async () => {
 		up = await new Upstream().start();
@@ -50,7 +54,7 @@ describe("controlled calls", () => {
 	});
 
 	const evidenceOf = (callId: string) =>
-		JSON.parse(readFileSync(path.join(proxy.storeDir, "evidence", callId), "utf8"));
+		JSON.parse(readFileSync(path.join(proxy.storeDir, "evidence", callId, "tenant_a"), "utf8"));
 
 	it("a normal call: one admission, one physical send, bounded frames, evidence and one observation with native usage", async () => {
 		up.next({
@@ -112,7 +116,7 @@ describe("controlled calls", () => {
 		expect(ev.request.body).toContain("Plan the hero component.");
 		expect(ev.request.body).not.toContain(credential);
 		expect(Buffer.from(ev.response.bodyBase64, "base64").toString()).toContain('"prompt_tokens":120');
-		expect(existsSync(path.join(proxy.storeDir, "pending", callId))).toBe(false);
+		expect(existsSync(path.join(proxy.storeDir, "pending", callId, "tenant_a"))).toBe(false);
 	});
 
 	it("tool calls carry the arguments digest and must name a reviewed schema by its digest", async () => {
@@ -284,14 +288,22 @@ describe("controlled calls", () => {
 		expect((changed.json as { error: { code: string } }).error.code).toBe("IDEMPOTENCY_CONFLICT");
 		const otherDigest = await call(proxy.url, "POST", "/api/v1/model-calls", body.replace(digest, digestOf("other")));
 		expect(otherDigest.status).toBe(409);
+		// The same call id under another tenant is not this call: its own
+		// admission, its own send, its own record — nothing of this one.
+		up.next({ kind: "stream", text: ["Twice"] });
 		const otherTenant = await call(
 			proxy.url,
 			"POST",
 			"/api/v1/model-calls",
 			body.replace('"tenantId":"tenant_a"', '"tenantId":"tenant_b"'),
 		);
-		expect(otherTenant.status).toBe(409);
-		expect(up.receives.length).toBe(sends);
+		expect(otherTenant.status, otherTenant.text).toBe(200);
+		expect(otherTenant.frames.find((f) => f.type === "text")?.text).toBe("Twice");
+		expect(up.receives.length).toBe(sends + 1);
+		expect(control.admits.length).toBe(admits + 1);
+		expect(control.dispatches.get(`tenant_b/anvilkit-agent-model-proxy/${callId}`)?.observations).toHaveLength(1);
+		expect((await call(proxy.url, "POST", "/api/v1/model-calls", body)).frames).toEqual(first.frames);
+		expect(up.receives.length).toBe(sends + 1);
 	});
 
 	it("a denied admission sends nothing, is recorded and answers the same denial again", async () => {
@@ -497,7 +509,7 @@ describe("controlled calls", () => {
 
 	it("cancellation before the send sends nothing; after the send it aborts and keeps the outcome unknown without usage", async () => {
 		const before = id("cancel-before");
-		await proxy.store.requestCancel(before, new Date().toISOString());
+		await proxy.store.requestCancel(scope(before), new Date().toISOString());
 		const sends = up.receives.length;
 		const r = await call(proxy.url, "POST", "/api/v1/model-calls", requestBody(before));
 		expect(r.status).toBe(200);
@@ -624,7 +636,7 @@ describe("controlled calls", () => {
 			expect(texts.map((f) => f.text).join("")).toBe(text);
 			for (const f of texts) expect((f.text ?? "").length % 2, "no broken surrogate pair").toBe(0);
 			expect(r.frames.at(-1)).toMatchObject({ type: "done", outcome: "succeeded" });
-			const rec = await framed.store.read(callId);
+			const rec = await framed.store.read(scope(callId));
 			expect(rec?.record.frames).toEqual(r.frames);
 			// Six frames at most: admitted, four content frames, the final one. Content
 			// needing the last slot ends the call with the bound as its explicit outcome —
@@ -638,7 +650,7 @@ describe("controlled calls", () => {
 			expect(m.frames.at(-1)).toMatchObject({ errorCode: "SEQUENCE_BOUND_EXCEEDED" });
 			expect(["failed", "unknown"]).toContain(m.frames.at(-1)?.outcome);
 			if (m.frames.at(-1)?.outcome === "failed") expect(m.frames.at(-1)?.usage).toMatchObject({ inputUnits: "12" });
-			const manyRecord = (await framed.store.read(many))?.record;
+			const manyRecord = (await framed.store.read(scope(many)))?.record;
 			expect(manyRecord).toMatchObject({ state: m.frames.at(-1)?.outcome, errorCode: "SEQUENCE_BOUND_EXCEEDED" });
 			expect(manyRecord?.frames).toEqual(m.frames);
 			// Exactly four content frames plus the usage frame do not fit: the usage frame is
@@ -661,7 +673,7 @@ describe("controlled calls", () => {
 			expect(a.frames.map((f) => f.type)).toEqual(["admitted", "error"]);
 			expect(a.frames.at(-1)).toMatchObject({ errorCode: "FRAME_BOUND_EXCEEDED" });
 			expect(["failed", "unknown"]).toContain(a.frames.at(-1)?.outcome);
-			expect((await framed.store.read(big))?.record).toMatchObject({
+			expect((await framed.store.read(scope(big)))?.record).toMatchObject({
 				state: a.frames.at(-1)?.outcome,
 				errorCode: "FRAME_BOUND_EXCEEDED",
 			});
@@ -692,6 +704,83 @@ describe("controlled calls", () => {
 		expect(control.byCall(callId)?.state).toBe(DispatchState.DISPATCH_STATE_OBSERVED);
 		const replay = await call(proxy.url, "POST", "/api/v1/model-calls", body);
 		expect(replay.frames.map((f) => f.type)).toEqual(["admitted", "text", "text", "text", "usage", "done"]);
+	});
+
+	it("one keep-alive connection serving completed streams, a mid-stream disconnect and more streams keeps no listener of the earlier responses: the counts on the socket stay at their baseline and Node raises no listener warning", async () => {
+		const warnings: string[] = [];
+		const onWarning = (w: Error) => warnings.push(w.name);
+		process.on("warning", onWarning);
+		const sockets: Socket[] = [];
+		const onConnection = (s: Socket) => sockets.push(s);
+		proxy.server.on("connection", onConnection);
+		const agent = new Agent({ keepAlive: true, maxSockets: 1 });
+		const countOn = (s: Socket) =>
+			["close", "drain", "error", "end", "timeout", "finish"].map((e) => s.listenerCount(e));
+		const settled = () => new Promise((r) => setTimeout(r, 30));
+		try {
+			let baseline: number[] | undefined;
+			for (let i = 0; i < 14; i++) {
+				up.next({ kind: "stream", text: ["k"], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+				const r = await call(
+					proxy.url,
+					"POST",
+					"/api/v1/model-calls",
+					requestBody(id("keepalive")),
+					token,
+					undefined,
+					agent,
+				);
+				expect(r.status, r.text).toBe(200);
+				expect(r.frames.at(-1)?.type).toBe("done");
+				await settled();
+				const socket = sockets.at(-1) as Socket;
+				if (baseline === undefined) baseline = countOn(socket);
+				else expect(countOn(socket), `after ${i + 1} streams`).toEqual(baseline);
+			}
+			expect(sockets, "every stream went over the one kept-alive connection").toHaveLength(1);
+			// A caller that goes away mid-stream ends that connection; the ones after it start clean.
+			up.next({
+				kind: "stream",
+				text: ["first", " second", " third"],
+				usage: { prompt_tokens: 1, completion_tokens: 1 },
+			});
+			const gone = id("keepalive-gone");
+			const partial = await call(
+				proxy.url,
+				"POST",
+				"/api/v1/model-calls",
+				requestBody(gone),
+				token,
+				(f) => f.length >= 2,
+				agent,
+			);
+			expect(partial.frames).toHaveLength(2);
+			for (let i = 0; i < 50 && (await proxy.store.read(scope(gone)))?.record.state !== "succeeded"; i++)
+				await settled();
+			expect((await proxy.store.read(scope(gone)))?.record.state).toBe("succeeded");
+			for (let i = 0; i < 3; i++) {
+				up.next({ kind: "stream", text: ["k"], usage: { prompt_tokens: 1, completion_tokens: 1 } });
+				const r = await call(
+					proxy.url,
+					"POST",
+					"/api/v1/model-calls",
+					requestBody(id("keepalive-after")),
+					token,
+					undefined,
+					agent,
+				);
+				expect(r.frames.at(-1)?.type).toBe("done");
+				await settled();
+				expect(countOn(sockets.at(-1) as Socket), `after the disconnect, stream ${i + 1}`).toEqual(baseline);
+			}
+			expect(sockets.length).toBe(2);
+			await new Promise((r) => setImmediate(r));
+			expect(warnings).not.toContain("MaxListenersExceededWarning");
+		} finally {
+			agent.destroy();
+			proxy.server.off("connection", onConnection);
+			process.off("warning", onWarning);
+		}
 	});
 
 	it("a cancel that lands between the settlement's read and its conditional write does not lose the outcome: the record is reapplied with the usage, the caller receives the persisted outcome, and the marker precedes the record", async () => {
@@ -742,17 +831,113 @@ describe("controlled calls", () => {
 				outcome: "succeeded",
 				usage: { inputUnits: "8", outputUnits: "2" },
 			});
-			const rec = (await raced.store.read(callId))?.record;
+			const rec = (await raced.store.read(scope(callId)))?.record;
 			expect(rec).toMatchObject({ state: "succeeded", usage: { inputUnits: "8", outputUnits: "2" } });
 			expect(rec?.cancelRequestedAt).toBeDefined();
 			expect(rec?.observations).toHaveLength(1);
 			expect(rec?.observations[0]?.submitted).toBe(true);
 			expect(control.byCall(callId)?.observations).toHaveLength(1);
 			expect(control.byCall(callId)?.observations[0]).toMatchObject({ usage: { input: "8", output: "2" } });
-			expect(existsSync(path.join(raced.storeDir, "pending", callId))).toBe(false);
+			expect(existsSync(path.join(raced.storeDir, "pending", callId, "tenant_a"))).toBe(false);
 			expect(up.receives.length).toBe(sends + 1);
 		} finally {
 			await raced.close();
+		}
+	});
+
+	it("the permission holder takes over the PERMISSION_LOST placeholder a duplicate recorded under its identity and sends once; a placeholder of another dispatch or another caller is never overwritten", async () => {
+		// The placeholder appears between the holder's read and its create: the
+		// store double writes it from the holder's own record so the identity
+		// (caller, tenant, digests) is exact, varying only what each case tests.
+		let placeholder: ((holder: Record<string, unknown>) => Record<string, unknown>) | undefined;
+		let created: string[] = [];
+		const wrap = (inner: ObjectStore): ObjectStore => ({
+			...inner,
+			get: (k) => inner.get(k),
+			delete: (k) => inner.delete(k),
+			list: (p) => inner.list(p),
+			qualify: () => inner.qualify(),
+			describe: () => inner.describe(),
+			put: async (key: string, body: Uint8Array, opts?: PutOptions) => {
+				if (key.startsWith("calls/") && opts?.ifNoneMatch && placeholder) {
+					const holder = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
+					if (holder.state === "sending") {
+						const stale = placeholder;
+						placeholder = undefined;
+						await inner.put(key, new TextEncoder().encode(JSON.stringify(stale(holder))), { ifNoneMatch: true });
+					}
+				}
+				if (key.startsWith("calls/") && opts?.ifMatch) {
+					created.push((JSON.parse(new TextDecoder().decode(body)) as { state: string }).state);
+				}
+				return inner.put(key, body, opts);
+			},
+		});
+		const holder = await startProxy({
+			upstreamUrl: up.url,
+			controlAddress: control.address,
+			instanceId: "h",
+			objects: wrap,
+		});
+		try {
+			// The duplicate's placeholder under the same identity and dispatch: taken over, one send.
+			placeholder = (h) => ({
+				...h,
+				state: "unknown",
+				errorCode: "PERMISSION_LOST",
+				frames: [{ callId: h.callId, sequence: "0", type: "admitted" }],
+			});
+			up.next({ kind: "stream", text: ["taken over"], usage: { prompt_tokens: 3, completion_tokens: 1 } });
+			const taken = id("takeover");
+			let sends = up.receives.length;
+			const r = await call(holder.url, "POST", "/api/v1/model-calls", requestBody(taken));
+			expect(r.status, r.text).toBe(200);
+			expect(r.frames.map((f) => f.type)).toEqual(["admitted", "text", "usage", "done"]);
+			expect(created[0]).toBe("sending");
+			expect(up.receives.length).toBe(sends + 1);
+			const rec = (await holder.store.read(scope(taken)))?.record;
+			expect(rec).toMatchObject({ state: "succeeded", dispatchId: control.byCall(taken)?.dispatchId });
+			expect(control.byCall(taken)?.observations).toHaveLength(1);
+			// A record of another dispatch under the scope: kept as it is, nothing sent, the caller attached to it.
+			created = [];
+			placeholder = (h) => ({
+				...h,
+				dispatchId: "dsp_someone_elses",
+				state: "unknown",
+				errorCode: "PERMISSION_LOST",
+				frames: [
+					{ callId: h.callId, sequence: "0", type: "admitted" },
+					{ callId: h.callId, sequence: "1", type: "error", outcome: "unknown", errorCode: "PERMISSION_LOST" },
+				],
+			});
+			const foreign = id("foreign-dispatch");
+			sends = up.receives.length;
+			const f = await call(holder.url, "POST", "/api/v1/model-calls", requestBody(foreign));
+			expect(f.status, f.text).toBe(200);
+			expect(f.frames.at(-1)).toMatchObject({ type: "error", errorCode: "PERMISSION_LOST" });
+			expect(created).toEqual([]);
+			expect(up.receives.length).toBe(sends);
+			expect((await holder.store.read(scope(foreign)))?.record).toMatchObject({
+				dispatchId: "dsp_someone_elses",
+				state: "unknown",
+			});
+			// A record of another caller under the scope: refused as a reentry is, never replaced, nothing sent.
+			placeholder = (h) => ({
+				...h,
+				principalId: "anvilkit-job-access-sidecar",
+				state: "unknown",
+				errorCode: "PERMISSION_LOST",
+			});
+			const theirs = id("foreign-caller");
+			sends = up.receives.length;
+			const t = await call(holder.url, "POST", "/api/v1/model-calls", requestBody(theirs));
+			expect(t.status).toBe(403);
+			expect((t.json as { error: { code: string } }).error.code).toBe("FORBIDDEN");
+			expect(created).toEqual([]);
+			expect(up.receives.length).toBe(sends);
+			expect((await holder.store.read(scope(theirs)))?.record.principalId).toBe("anvilkit-job-access-sidecar");
+		} finally {
+			await holder.close();
 		}
 	});
 
@@ -766,14 +951,14 @@ describe("controlled calls", () => {
 		let mine: typeof control.observes = [];
 		for (let i = 0; i < 100; i++) {
 			mine = control.observes.filter((o) => o.dispatchId === dispatchId);
-			if (mine.length >= 2 && !existsSync(path.join(proxy.storeDir, "pending", callId))) break;
+			if (mine.length >= 2 && !existsSync(path.join(proxy.storeDir, "pending", callId, "tenant_a"))) break;
 			await new Promise((res) => setTimeout(res, 50));
 		}
 		expect(mine.length).toBe(2);
 		expect(mine[0]?.source).toBe(mine[1]?.source);
 		expect(mine[0]?.sequence).toBe(mine[1]?.sequence);
 		expect(control.byCall(callId)?.observations).toHaveLength(1);
-		const rec = await proxy.store.read(callId);
+		const rec = await proxy.store.read(scope(callId));
 		expect(rec?.record.observations.every((o) => o.submitted)).toBe(true);
 	});
 
@@ -808,7 +993,7 @@ describe("controlled calls", () => {
 		const replay = await call(proxy.url, "POST", "/api/v1/model-calls", body, sidecarToken);
 		expect(replay.status).toBe(403);
 		expect((replay.json as { error: { code: string } }).error.code).toBe("FORBIDDEN");
-		expect(await proxy.store.cancelRequested(callId)).toBeUndefined();
+		expect(await proxy.store.cancelRequested(scope(callId))).toBeUndefined();
 		// Control's recovery query reads the record; it neither cancels nor reenters.
 		const byControl = await call(proxy.url, "GET", `/api/v1/model-calls/${callId}`, undefined, controlToken);
 		expect(byControl.status).toBe(200);
@@ -817,7 +1002,7 @@ describe("controlled calls", () => {
 			(await call(proxy.url, "POST", `/api/v1/model-calls/${callId}/cancellations`, "{}", controlToken)).status,
 		).toBe(404);
 		expect((await call(proxy.url, "POST", "/api/v1/model-calls", body, controlToken)).status).toBe(403);
-		expect(await proxy.store.cancelRequested(callId)).toBeUndefined();
+		expect(await proxy.store.cancelRequested(scope(callId))).toBeUndefined();
 		// The caller's other replica (the same principal) attaches to the live send and cancels it.
 		const other = await startProxy({
 			upstreamUrl: up.url,
@@ -924,18 +1109,52 @@ describe("two Proxy instances on one store", () => {
 		up.release();
 	});
 
-	it("a settlement whose record write was lost is completed from the evidence by the other instance's sweep: the original outcome and usage, one observation, no send; repeated sweeps add nothing", async () => {
-		const callId = `call_evidence_${Date.now()}`;
-		control.dispatches.set(`tenant_a/anvilkit-agent-model-proxy/${callId}`, {
-			dispatchId: "dsp_fake_evidence",
+	/** A record as the sender leaves it before its send (marker first, then the record). */
+	const sendingRecord = (callId: string, tenantId: string, dispatchId: string, deadline: string) => {
+		const now = new Date().toISOString();
+		return {
+			callId,
+			tenantId,
+			principalId: "anvilkit-agent-workflow",
+			routeId: "controlled-openai-v1",
+			provider: "fixture",
+			model: "fixture-model",
+			requestDigest: digest,
+			contentDigest: digest,
+			binding: { tenantId, operationId: "op_1", attemptId: "att_1", executionEpoch: "1" },
+			deadline,
+			maxExposure: { currency: "USD", amount: "1000" },
+			maxOutputTokens: 1,
+			dispatchId,
+			state: "sending" as const,
+			createdAt: now,
+			updatedAt: now,
+			revision: 1,
+			frames: [],
+			observations: [],
+		};
+	};
+	const fakeDispatch = (callId: string, tenantId: string, dispatchId: string) => {
+		control.dispatches.set(`${tenantId}/anvilkit-agent-model-proxy/${callId}`, {
+			dispatchId,
 			callId,
 			owner: "anvilkit-agent-model-proxy",
-			tenantId: "tenant_a",
+			tenantId,
 			digest: "x",
 			state: DispatchState.DISPATCH_STATE_AUTHORIZED,
 			outcome: DispatchOutcome.DISPATCH_OUTCOME_UNSPECIFIED,
 			observations: [],
 		});
+	};
+	const markerOf = (callId: string, tenantId = "tenant_a") => path.join(a.storeDir, "pending", callId, tenantId);
+	const untilGone = async (file: string) => {
+		for (let i = 0; i < 100 && existsSync(file); i++) await new Promise((r) => setTimeout(r, 50));
+	};
+
+	it("a settlement whose record write was lost is completed from the evidence by the other instance's sweep: the original outcome and usage, one observation, no send; repeated sweeps add nothing", async () => {
+		const callId = `call_evidence_${Date.now()}`;
+		const scope = { tenantId: "tenant_a", callId };
+		fakeDispatch(callId, "tenant_a", "dsp_fake_evidence");
 		const now = new Date().toISOString();
 		const deadline = new Date(Date.now() + 60_000).toISOString();
 		const usage = { inputUnits: "9", outputUnits: "4", reasoningUnits: "0", cachedInputUnits: "0" };
@@ -946,30 +1165,11 @@ describe("two Proxy instances on one store", () => {
 			{ callId, sequence: "3", type: "done", outcome: "succeeded", usage },
 		];
 		// The sender's durable order up to its loss: marker, record (sending), evidence with the settlement.
-		await a.store.markPending(callId, deadline);
-		await a.store.create({
-			callId,
-			tenantId: "tenant_a",
-			principalId: "anvilkit-agent-workflow",
-			routeId: "controlled-openai-v1",
-			provider: "fixture",
-			model: "fixture-model",
-			requestDigest: digest,
-			contentDigest: digest,
-			binding: { tenantId: "tenant_a", operationId: "op_1", attemptId: "att_1", executionEpoch: "1" },
-			deadline,
-			maxExposure: { currency: "USD", amount: "1000" },
-			maxOutputTokens: 1,
-			dispatchId: "dsp_fake_evidence",
-			state: "sending",
-			createdAt: now,
-			updatedAt: now,
-			revision: 1,
-			frames: [],
-			observations: [],
-		});
+		await a.store.markPending(scope, deadline);
+		await a.store.create(sendingRecord(callId, "tenant_a", "dsp_fake_evidence", deadline));
 		await a.store.writeEvidence({
 			callId,
+			tenantId: "tenant_a",
 			dispatchId: "dsp_fake_evidence",
 			routeId: "controlled-openai-v1",
 			capturedAt: now,
@@ -986,8 +1186,7 @@ describe("two Proxy instances on one store", () => {
 		const sends = up.receives.length;
 		const swept = await b.calls.sweep();
 		expect(swept).toMatchObject({ completed: 1, reclaimed: 0 });
-		for (let i = 0; i < 100 && existsSync(path.join(a.storeDir, "pending", callId)); i++)
-			await new Promise((r) => setTimeout(r, 50));
+		await untilGone(markerOf(callId));
 		expect(up.receives.length).toBe(sends);
 		expect(control.byCall(callId)?.state).toBe(DispatchState.DISPATCH_STATE_OBSERVED);
 		expect(control.byCall(callId)?.observations).toHaveLength(1);
@@ -999,7 +1198,7 @@ describe("two Proxy instances on one store", () => {
 		});
 		const g = await call(a.url, "GET", `/api/v1/model-calls/${callId}`);
 		expect(g.json).toMatchObject({ state: "succeeded", usage, nativeReference: "chatcmpl-settled" });
-		expect((await a.store.read(callId))?.record.frames).toEqual(frames);
+		expect((await a.store.read(scope))?.record.frames).toEqual(frames);
 		const again = await a.calls.sweep();
 		expect(again).toMatchObject({ completed: 0, reclaimed: 0, resubmitted: 0 });
 		await b.calls.sweep();
@@ -1008,56 +1207,27 @@ describe("two Proxy instances on one store", () => {
 	});
 
 	it("a pending marker without a record (the opener died between the marker and the record) is kept until the call's deadline plus grace, then cleared", async () => {
-		const young = `call_marker_young_${Date.now()}`;
-		const old = `call_marker_old_${Date.now()}`;
+		const young = { tenantId: "tenant_a", callId: `call_marker_young_${Date.now()}` };
+		const old = { tenantId: "tenant_a", callId: `call_marker_old_${Date.now()}` };
 		await a.store.markPending(young, new Date(Date.now() + 60_000).toISOString());
 		await a.store.markPending(old, new Date(Date.now() - 60_000).toISOString());
 		await b.calls.sweep();
-		expect(await a.store.listPending()).toContain(young);
-		expect(await a.store.listPending()).not.toContain(old);
+		expect(await a.store.listPending()).toContainEqual(young);
+		expect(await a.store.listPending()).not.toContainEqual(old);
 		await a.store.clearPending(young);
 	});
 
-	it("a send lost with its process is reclaimed as unknown by the sweep after the deadline, never resent; pending observations are resubmitted", async () => {
+	it("a send lost with its process is reclaimed as unknown by the sweep after the deadline, never resent; pending observations are resubmitted; the marker stays for the late-settlement window", async () => {
 		const callId = `call_lost_${Date.now()}`;
-		const dispatch = { dispatchId: "dsp_fake_lost" };
-		control.dispatches.set(`tenant_a/anvilkit-agent-model-proxy/${callId}`, {
-			dispatchId: dispatch.dispatchId,
-			callId,
-			owner: "anvilkit-agent-model-proxy",
-			tenantId: "tenant_a",
-			digest: "x",
-			state: DispatchState.DISPATCH_STATE_AUTHORIZED,
-			outcome: DispatchOutcome.DISPATCH_OUTCOME_UNSPECIFIED,
-			observations: [],
-		});
-		const now = new Date().toISOString();
-		await a.store.create({
-			callId,
-			tenantId: "tenant_a",
-			principalId: "anvilkit-agent-workflow",
-			routeId: "controlled-openai-v1",
-			provider: "fixture",
-			model: "fixture-model",
-			requestDigest: "sha256:0dc7fa9db7237a2b5c96f70f59bb00f73bb86a0ca5554e91c312f9ada26e18b3",
-			contentDigest: "sha256:0dc7fa9db7237a2b5c96f70f59bb00f73bb86a0ca5554e91c312f9ada26e18b3",
-			binding: { tenantId: "tenant_a", operationId: "op_1", attemptId: "att_1", executionEpoch: "1" },
-			deadline: new Date(Date.now() - 2000).toISOString(),
-			maxExposure: { currency: "USD", amount: "1000" },
-			maxOutputTokens: 1,
-			dispatchId: dispatch.dispatchId,
-			state: "sending",
-			createdAt: now,
-			updatedAt: now,
-			revision: 1,
-			frames: [],
-			observations: [],
-		});
-		await a.store.markPending(callId, new Date(Date.now() - 2000).toISOString());
+		const scope = { tenantId: "tenant_a", callId };
+		fakeDispatch(callId, "tenant_a", "dsp_fake_lost");
+		const past = new Date(Date.now() - 2000).toISOString();
+		await a.store.create(sendingRecord(callId, "tenant_a", "dsp_fake_lost", past));
+		await a.store.markPending(scope, past);
 		const sends = up.receives.length;
 		const swept = await b.calls.sweep();
 		expect(swept.reclaimed).toBe(1);
-		for (let i = 0; i < 100 && existsSync(path.join(a.storeDir, "pending", callId)); i++)
+		for (let i = 0; i < 100 && !control.byCall(callId)?.observations.length; i++)
 			await new Promise((r) => setTimeout(r, 50));
 		expect(up.receives.length).toBe(sends);
 		expect(control.byCall(callId)?.state).toBe(DispatchState.DISPATCH_STATE_UNKNOWN);
@@ -1074,6 +1244,269 @@ describe("two Proxy instances on one store", () => {
 			requestBody(callId, { deadline: new Date(Date.now() + 60_000).toISOString() }),
 		);
 		expect(replay.status).toBe(409);
+		expect(up.receives.length).toBe(sends);
+		// The observation is submitted, yet the marker stays: the lost sender's
+		// evidence may still land. It goes once the late-settlement window passed.
+		expect((await a.store.read(scope))?.record.observations.every((o) => o.submitted)).toBe(true);
+		expect(existsSync(markerOf(callId))).toBe(true);
+		await b.calls.sweep();
+		expect(existsSync(markerOf(callId))).toBe(true);
+		await new Promise((r) => setTimeout(r, a.cfg.observation.lateSettlementWindowMs + 100));
+		await b.calls.sweep();
+		expect(existsSync(markerOf(callId))).toBe(false);
+		expect(control.byCall(callId)?.observations).toHaveLength(1);
+	});
+
+	it("evidence that lands after the reclaim, its sender lost before publishing, is completed by any instance's sweep: the actual settlement and usage under the original dispatch, no send; repeated sweeps and a lost observation receipt add no charge", async () => {
+		const callId = `call_late_${Date.now()}`;
+		const scope = { tenantId: "tenant_a", callId };
+		fakeDispatch(callId, "tenant_a", "dsp_fake_late");
+		const past = new Date(Date.now() - 2000).toISOString();
+		await a.store.create(sendingRecord(callId, "tenant_a", "dsp_fake_late", past));
+		await a.store.markPending(scope, past);
+		const sends = up.receives.length;
+		// The sweep reclaims the send as unknown and submits that; Control retains the exposure.
+		expect((await b.calls.sweep()).reclaimed).toBe(1);
+		for (let i = 0; i < 100 && !control.byCall(callId)?.observations.length; i++)
+			await new Promise((r) => setTimeout(r, 50));
+		expect(control.byCall(callId)?.state).toBe(DispatchState.DISPATCH_STATE_UNKNOWN);
+		// The sender, slow rather than dead, persists its evidence with the
+		// settlement and re-marks the call as the send path does — then dies
+		// before publishing the record.
+		const usage = { inputUnits: "21", outputUnits: "5", reasoningUnits: "0", cachedInputUnits: "0" };
+		const frames: StreamFrame[] = [
+			{ callId, sequence: "0", type: "admitted" },
+			{ callId, sequence: "1", type: "text", text: "late" },
+			{ callId, sequence: "2", type: "usage", usage },
+			{ callId, sequence: "3", type: "done", outcome: "succeeded", usage },
+		];
+		await a.store.writeEvidence({
+			callId,
+			tenantId: "tenant_a",
+			dispatchId: "dsp_fake_late",
+			routeId: "controlled-openai-v1",
+			capturedAt: new Date().toISOString(),
+			request: {
+				method: "POST",
+				url: `${up.url}/v1/chat/completions`,
+				contentType: "",
+				body: "{}",
+				bodyTruncated: false,
+			},
+			response: { status: 200, headers: {}, bodyBase64: "", bodyBytes: 0, bodyTruncated: false },
+			settlement: { outcome: "succeeded", usage, nativeReference: "chatcmpl-late", frames },
+		});
+		await a.store.markPending(scope, past);
+		// The other instance's sweep completes it; its first observation receipt is lost.
+		control.loseObserveAnswers = 1;
+		const swept = await a.calls.sweep();
+		expect(swept).toMatchObject({ completed: 1, reclaimed: 0 });
+		await untilGone(markerOf(callId));
+		expect(existsSync(markerOf(callId))).toBe(false);
+		expect(up.receives.length).toBe(sends);
+		const rec = (await a.store.read(scope))?.record;
+		expect(rec).toMatchObject({
+			state: "succeeded",
+			usage,
+			nativeReference: "chatcmpl-late",
+			dispatchId: "dsp_fake_late",
+		});
+		expect(rec?.frames).toEqual(frames);
+		expect(rec?.observations.map((o) => [o.outcome, o.submitted])).toEqual([
+			["unknown", true],
+			["succeeded", true],
+		]);
+		const dispatch = control.byCall(callId);
+		expect(dispatch?.state).toBe(DispatchState.DISPATCH_STATE_OBSERVED);
+		expect(dispatch?.observations.map((o) => o.outcome)).toEqual([
+			DispatchOutcome.DISPATCH_OUTCOME_UNKNOWN,
+			DispatchOutcome.DISPATCH_OUTCOME_SUCCEEDED,
+		]);
+		expect(dispatch?.observations[1]).toMatchObject({ source: "model-proxy/a", usage: { input: "21", output: "5" } });
+		// The lost receipt was resubmitted under the same source and sequence: one observation, not two.
+		const submitted = control.observes.filter((o) => o.dispatchId === "dsp_fake_late");
+		expect(submitted.length).toBe(3);
+		expect(submitted[1]?.sequence).toBe(submitted[2]?.sequence);
+		const g = await call(a.url, "GET", `/api/v1/model-calls/${callId}`);
+		expect(g.json).toMatchObject({ state: "succeeded", usage, nativeReference: "chatcmpl-late" });
+		for (const instance of [a, b]) {
+			expect(await instance.calls.sweep()).toMatchObject({ completed: 0, reclaimed: 0, resubmitted: 0 });
+		}
+		expect(control.byCall(callId)?.observations).toHaveLength(2);
+		expect(up.receives.length).toBe(sends);
+		// Evidence that establishes nothing more than the reclaim keeps the
+		// unknown exposure: no observation, and the marker is released.
+		const vague = `call_vague_${Date.now()}`;
+		const vagueScope = { tenantId: "tenant_a", callId: vague };
+		fakeDispatch(vague, "tenant_a", "dsp_fake_vague");
+		await a.store.create(sendingRecord(vague, "tenant_a", "dsp_fake_vague", past));
+		await a.store.markPending(vagueScope, past);
+		expect((await b.calls.sweep()).reclaimed).toBe(1);
+		for (let i = 0; i < 100 && !control.byCall(vague)?.observations.length; i++)
+			await new Promise((r) => setTimeout(r, 50));
+		await a.store.writeEvidence({
+			callId: vague,
+			tenantId: "tenant_a",
+			dispatchId: "dsp_fake_vague",
+			routeId: "controlled-openai-v1",
+			capturedAt: new Date().toISOString(),
+			request: {
+				method: "POST",
+				url: `${up.url}/v1/chat/completions`,
+				contentType: "",
+				body: "{}",
+				bodyTruncated: false,
+			},
+			transportError: "socket hang up",
+			settlement: {
+				outcome: "unknown",
+				errorCode: "UPSTREAM_ERROR",
+				frames: [
+					{ callId: vague, sequence: "0", type: "admitted" },
+					{ callId: vague, sequence: "1", type: "error", outcome: "unknown", errorCode: "UPSTREAM_ERROR" },
+				],
+			},
+		});
+		await a.store.markPending(vagueScope, past);
+		expect((await b.calls.sweep()).completed).toBe(1);
+		await untilGone(markerOf(vague));
+		expect((await a.store.read(vagueScope))?.record).toMatchObject({
+			state: "unknown",
+			errorCode: "UPSTREAM_ERROR",
+			evidenceRef: `evidence/${vague}/tenant_a`,
+		});
+		expect(control.byCall(vague)?.observations).toHaveLength(1);
+		expect(control.byCall(vague)?.state).toBe(DispatchState.DISPATCH_STATE_UNKNOWN);
+		expect(up.receives.length).toBe(sends);
+	});
+
+	it("evidence of another dispatch never settles a record: the call keeps its own outcome", async () => {
+		const callId = `call_foreign_${Date.now()}`;
+		const scope = { tenantId: "tenant_a", callId };
+		fakeDispatch(callId, "tenant_a", "dsp_fake_own");
+		const past = new Date(Date.now() - 2000).toISOString();
+		await a.store.create(sendingRecord(callId, "tenant_a", "dsp_fake_own", past));
+		await a.store.markPending(scope, past);
+		await a.store.writeEvidence({
+			callId,
+			tenantId: "tenant_a",
+			dispatchId: "dsp_fake_other",
+			routeId: "controlled-openai-v1",
+			capturedAt: new Date().toISOString(),
+			request: { method: "POST", url: "u", contentType: "", body: "{}", bodyTruncated: false },
+			settlement: {
+				outcome: "succeeded",
+				usage: { inputUnits: "1", outputUnits: "1", reasoningUnits: "0", cachedInputUnits: "0" },
+				frames: [],
+			},
+		});
+		const swept = await b.calls.sweep();
+		expect(swept).toMatchObject({ completed: 0, reclaimed: 1 });
+		for (let i = 0; i < 100 && !control.byCall(callId)?.observations.length; i++)
+			await new Promise((r) => setTimeout(r, 50));
+		expect((await a.store.read(scope))?.record).toMatchObject({ state: "unknown", errorCode: "SENDER_LOST" });
+		expect(control.byCall(callId)?.state).toBe(DispatchState.DISPATCH_STATE_UNKNOWN);
+	});
+
+	it("two tenants under one call id are two calls: each principal's own admission, send, record, evidence, cancel and settlement; neither reads, moves or replaces the other", async () => {
+		up.next({ kind: "stream", text: ["for tenant a"] }, { kind: "stream-then-hang", text: ["for tenant b"] });
+		const callId = `call_shared_${Date.now()}`;
+		const forA = requestBody(callId);
+		const forB = requestBody(callId, {
+			binding: { tenantId: "tenant_b", operationId: "op_9", attemptId: "att_9", executionEpoch: "1" },
+			messages: [{ role: "user", content: "Something else entirely." }],
+		});
+		const sends = up.receives.length;
+		const ra = await call(a.url, "POST", "/api/v1/model-calls", forA);
+		expect(ra.status, ra.text).toBe(200);
+		expect(ra.frames.at(-1)).toMatchObject({ type: "done", outcome: "succeeded" });
+		// The other tenant's call, from the sidecar, on the other instance, while the first is settled.
+		const streaming = call(b.url, "POST", "/api/v1/model-calls", forB, sidecarToken);
+		await up.awaitHeld();
+		expect(up.receives.length).toBe(sends + 2);
+		const dispatchA = control.dispatches.get(`tenant_a/anvilkit-agent-model-proxy/${callId}`);
+		const dispatchB = control.dispatches.get(`tenant_b/anvilkit-agent-model-proxy/${callId}`);
+		expect(dispatchA?.dispatchId).toBeDefined();
+		expect(dispatchB?.dispatchId).toBeDefined();
+		expect(dispatchA?.dispatchId).not.toBe(dispatchB?.dispatchId);
+		// Each principal reads its own; a query by the id alone never crosses tenants.
+		const ga = await call(a.url, "GET", `/api/v1/model-calls/${callId}`);
+		expect(ga.json).toMatchObject({ callId, state: "succeeded", dispatchId: dispatchA?.dispatchId });
+		const gb = await call(b.url, "GET", `/api/v1/model-calls/${callId}`, undefined, sidecarToken);
+		expect(gb.json).toMatchObject({ callId, state: "sending", dispatchId: dispatchB?.dispatchId });
+		// A cancel by the workflow principal lands on nothing of tenant b's send.
+		const ca = await call(a.url, "POST", `/api/v1/model-calls/${callId}/cancellations`, "{}");
+		expect(ca.status).toBe(202);
+		expect(ca.json).toMatchObject({ dispatchId: dispatchA?.dispatchId, state: "succeeded" });
+		expect(await a.store.cancelRequested({ tenantId: "tenant_b", callId })).toBeUndefined();
+		// A reentry of tenant a's call from the sidecar is refused (another caller), tenant b's send is untouched.
+		expect((await call(b.url, "POST", "/api/v1/model-calls", forA, sidecarToken)).status).toBe(403);
+		expect(up.receives.length).toBe(sends + 2);
+		// The sidecar cancels its own; the workflow's record stays as it was.
+		const cb = await call(a.url, "POST", `/api/v1/model-calls/${callId}/cancellations`, "{}", sidecarToken);
+		expect(cb.status).toBe(202);
+		expect(cb.json).toMatchObject({ dispatchId: dispatchB?.dispatchId });
+		const rb = await streaming;
+		expect(rb.frames.at(-1)).toMatchObject({ type: "error", outcome: "unknown", errorCode: "CANCELED" });
+		up.release();
+		const recA = (await a.store.read({ tenantId: "tenant_a", callId }))?.record;
+		const recB = (await a.store.read({ tenantId: "tenant_b", callId }))?.record;
+		expect(recA).toMatchObject({
+			state: "succeeded",
+			principalId: "anvilkit-agent-workflow",
+			dispatchId: dispatchA?.dispatchId,
+		});
+		expect(recA?.cancelRequestedAt).toBeUndefined();
+		expect(recB).toMatchObject({
+			state: "unknown",
+			principalId: "anvilkit-job-access-sidecar",
+			dispatchId: dispatchB?.dispatchId,
+		});
+		expect(recA?.evidenceRef).toBe(`evidence/${callId}/tenant_a`);
+		expect(recB?.evidenceRef).toBe(`evidence/${callId}/tenant_b`);
+		expect(dispatchA?.observations).toHaveLength(1);
+		expect(dispatchB?.observations).toHaveLength(1);
+		expect(dispatchA?.observations[0]?.outcome).toBe(DispatchOutcome.DISPATCH_OUTCOME_SUCCEEDED);
+		expect(dispatchB?.observations[0]?.outcome).toBe(DispatchOutcome.DISPATCH_OUTCOME_UNKNOWN);
+		// Control's trusted query, by id alone, cannot name the tenant among two: it is answered nothing.
+		expect((await call(a.url, "GET", `/api/v1/model-calls/${callId}`, undefined, controlToken)).status).toBe(404);
+		// The same principal opening the id for a third tenant is a third call — and its own queries by the
+		// id alone are answered nothing rather than one of its two, while the binding still names each.
+		up.next({ kind: "stream", text: ["for tenant c"] });
+		const forC = requestBody(callId, {
+			binding: { tenantId: "tenant_c", operationId: "op_3", attemptId: "att_3", executionEpoch: "1" },
+		});
+		const rc = await call(a.url, "POST", "/api/v1/model-calls", forC);
+		expect(rc.status, rc.text).toBe(200);
+		expect(rc.frames.at(-1)).toMatchObject({ type: "done", outcome: "succeeded" });
+		expect(up.receives.length).toBe(sends + 3);
+		expect((await call(a.url, "GET", `/api/v1/model-calls/${callId}`)).status).toBe(404);
+		expect((await call(a.url, "POST", "/api/v1/model-calls", forA)).frames).toEqual(ra.frames);
+		expect((await call(b.url, "POST", "/api/v1/model-calls", forC)).frames).toEqual(rc.frames);
+		expect(up.receives.length).toBe(sends + 3);
+		expect(await a.store.listCalls(callId)).toHaveLength(3);
+	});
+
+	it("the permission holder takes over only the placeholder a duplicate recorded under the same identity; another identity's record under the scope is never overwritten", async () => {
+		// A lost first answer on instance a records PERMISSION_LOST; the same
+		// request reentered on instance b is answered that record, never a send.
+		control.loseAdmitAnswers = 1;
+		const lostId = `call_placeholder_${Date.now()}`;
+		const body = requestBody(lostId);
+		const sends = up.receives.length;
+		const first = await call(a.url, "POST", "/api/v1/model-calls", body);
+		expect(first.status, first.text).toBe(200);
+		expect(first.frames.at(-1)).toMatchObject({ type: "error", outcome: "unknown", errorCode: "PERMISSION_LOST" });
+		const again = await call(b.url, "POST", "/api/v1/model-calls", body);
+		expect(again.frames).toEqual(first.frames);
+		expect(up.receives.length).toBe(sends);
+		const placeholder = (await a.store.read({ tenantId: "tenant_a", callId: lostId }))?.record;
+		expect(placeholder).toMatchObject({ state: "unknown", errorCode: "PERMISSION_LOST" });
+		// Another caller's request under the same scope neither takes it over
+		// nor sends: the record is that of its own caller, as recorded.
+		const other = await call(b.url, "POST", "/api/v1/model-calls", body, sidecarToken);
+		expect(other.status).toBe(403);
+		expect((await a.store.read({ tenantId: "tenant_a", callId: lostId }))?.record).toEqual(placeholder);
 		expect(up.receives.length).toBe(sends);
 	});
 });

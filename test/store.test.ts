@@ -28,33 +28,74 @@ function semantics(name: string, make: () => Promise<ObjectStore>) {
 			await expect(store.put("calls/..", enc("x"))).rejects.toThrow(/invalid store key/);
 		});
 
-		it("keeps evidence immutable, pending markers and cancel intents idempotent", async () => {
+		it("keeps evidence immutable, pending markers and cancel intents idempotent, every object under the call's scope", async () => {
 			const calls = new CallStore(await make());
 			const callId = `call_${Date.now()}`;
+			const scope = { tenantId: "tenant_a", callId };
+			const other = { tenantId: "tenant_b", callId };
 			const evidence = {
 				callId,
+				tenantId: "tenant_a",
 				dispatchId: "d",
 				routeId: "r",
 				capturedAt: "2026-09-16T00:00:00Z",
 				request: { method: "POST", url: "u", contentType: "", body: "first", bodyTruncated: false },
 				settlement: { outcome: "unknown" as const, errorCode: "UPSTREAM_ERROR", frames: [] },
 			};
-			expect(await calls.writeEvidence(evidence)).toBe(`evidence/${callId}`);
+			expect(await calls.writeEvidence(evidence)).toBe(`evidence/${callId}/tenant_a`);
 			await calls.writeEvidence({ ...evidence, request: { ...evidence.request, body: "second" } });
-			expect((await calls.readEvidence(callId))?.request.body).toBe("first");
-			expect((await calls.readEvidence(callId))?.settlement.errorCode).toBe("UPSTREAM_ERROR");
-			await calls.markPending(callId, "2026-09-16T00:01:00Z");
-			await calls.markPending(callId, "2026-09-16T00:02:00Z");
-			expect(await calls.listPending()).toContain(callId);
-			expect(await calls.readPending(callId)).toEqual({ deadline: "2026-09-16T00:01:00Z" });
-			await calls.clearPending(callId);
-			expect(await calls.listPending()).not.toContain(callId);
-			expect(await calls.cancelRequested(callId)).toBeUndefined();
-			await calls.requestCancel(callId, "2026-09-16T00:00:01Z");
-			await calls.requestCancel(callId, "2026-09-16T00:00:02Z");
-			expect(await calls.cancelRequested(callId)).toBe("2026-09-16T00:00:01Z");
-			await calls.objects.delete(`evidence/${callId}`);
-			await calls.objects.delete(`cancel/${callId}`);
+			expect((await calls.readEvidence(scope))?.request.body).toBe("first");
+			expect((await calls.readEvidence(scope))?.settlement.errorCode).toBe("UPSTREAM_ERROR");
+			// Another tenant's call under the same id has objects of its own.
+			expect(await calls.readEvidence(other)).toBeUndefined();
+			await calls.writeEvidence({ ...evidence, tenantId: "tenant_b", request: { ...evidence.request, body: "b" } });
+			expect((await calls.readEvidence(other))?.request.body).toBe("b");
+			expect((await calls.readEvidence(scope))?.request.body).toBe("first");
+			await calls.markPending(scope, "2026-09-16T00:01:00Z");
+			await calls.markPending(scope, "2026-09-16T00:02:00Z");
+			expect(await calls.listPending()).toContainEqual(scope);
+			expect(await calls.listPending()).not.toContainEqual(other);
+			expect(await calls.readPending(scope)).toEqual({ deadline: "2026-09-16T00:01:00Z" });
+			await calls.clearPending(scope);
+			expect(await calls.listPending()).not.toContainEqual(scope);
+			expect(await calls.cancelRequested(scope)).toBeUndefined();
+			await calls.requestCancel(scope, "2026-09-16T00:00:01Z");
+			await calls.requestCancel(scope, "2026-09-16T00:00:02Z");
+			expect(await calls.cancelRequested(scope)).toBe("2026-09-16T00:00:01Z");
+			expect(await calls.cancelRequested(other)).toBeUndefined();
+			// A query by call id alone sees the scopes recorded under it, and nothing of another id.
+			const record = {
+				callId,
+				tenantId: "tenant_a",
+				principalId: "p",
+				routeId: "r",
+				provider: "x",
+				model: "y",
+				requestDigest: "d",
+				contentDigest: "c",
+				binding: { tenantId: "tenant_a", operationId: "o", attemptId: "a", executionEpoch: "1" },
+				deadline: "2026-09-16T00:01:00Z",
+				maxExposure: { currency: "USD", amount: "1" },
+				maxOutputTokens: 1,
+				dispatchId: "d",
+				state: "sending" as const,
+				createdAt: "2026-09-16T00:00:00Z",
+				updatedAt: "2026-09-16T00:00:00Z",
+				revision: 1,
+				frames: [],
+				observations: [],
+			};
+			await calls.create(record);
+			await calls.create({ ...record, tenantId: "tenant_b", binding: { ...record.binding, tenantId: "tenant_b" } });
+			await expect(calls.create(record)).rejects.toBeInstanceOf(PreconditionFailed);
+			expect(await calls.listCalls(callId)).toEqual([scope, other]);
+			expect(await calls.listCalls(`${callId}x`)).toEqual([]);
+			expect((await calls.read(other))?.record.tenantId).toBe("tenant_b");
+			for (const s of [scope, other]) {
+				await calls.objects.delete(`calls/${callId}/${s.tenantId}`);
+				await calls.objects.delete(`evidence/${callId}/${s.tenantId}`);
+			}
+			await calls.objects.delete(`cancel/${callId}/tenant_a`);
 		});
 	});
 }

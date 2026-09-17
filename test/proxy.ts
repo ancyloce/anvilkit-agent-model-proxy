@@ -4,7 +4,7 @@
 // client side speaks plain node:http and parses the event stream with
 // eventsource-parser.
 import { writeFileSync } from "node:fs";
-import { request as httpRequest } from "node:http";
+import { type Agent, request as httpRequest, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { createParser } from "eventsource-parser";
@@ -38,6 +38,8 @@ export interface ProxyOptions {
 
 export interface RunningProxy {
 	url: string;
+	/** The business listener (its connections are observable in the scenarios). */
+	server: Server;
 	/** The probe listener (plaintext, /healthz and /readyz only). */
 	healthUrl: string;
 	calls: CallService;
@@ -65,8 +67,8 @@ export function proxyConfig(o: ProxyOptions): Config {
 		.replace("    enabled: false\n", "    enabled: true\n")
 		.replace("base_url: http://127.0.0.1:1/v1", `base_url: ${o.upstreamUrl}/v1`)
 		.replace(
-			"  retry_initial: 1s\n  retry_max_interval: 30s\n  sweep_interval: 30s\n  reclaim_grace: 30s",
-			"  retry_initial: 50ms\n  retry_max_interval: 200ms\n  sweep_interval: 1s\n  reclaim_grace: 500ms",
+			"  retry_initial: 1s\n  retry_max_interval: 30s\n  sweep_interval: 30s\n  reclaim_grace: 30s\n  late_settlement_window: 1h",
+			"  retry_initial: 50ms\n  retry_max_interval: 200ms\n  sweep_interval: 1s\n  reclaim_grace: 500ms\n  late_settlement_window: 1500ms",
 		)
 		.replace(
 			"    initial: 500ms\n    max_interval: 5s\n    max_attempts: 5",
@@ -115,6 +117,7 @@ export async function startProxy(o: ProxyOptions): Promise<RunningProxy> {
 	const healthUrl = `http://127.0.0.1:${(health.address() as AddressInfo).port}`;
 	return {
 		url,
+		server,
 		healthUrl,
 		calls,
 		store,
@@ -139,7 +142,7 @@ export interface Reply {
 	json?: unknown;
 }
 
-/** One HTTP request; an SSE answer is collected into frames (optionally stopping early). */
+/** One HTTP request; an SSE answer is collected into frames (optionally stopping early); `agent` selects the connection reuse. */
 export function call(
 	url: string,
 	method: string,
@@ -147,12 +150,13 @@ export function call(
 	body?: string,
 	auth: string | null = token,
 	stopAfter?: (frames: StreamFrame[]) => boolean,
+	agent?: Agent,
 ): Promise<Reply> {
 	return new Promise((resolve, reject) => {
 		const u = new URL(pathname, url);
 		const headers: Record<string, string> = { "content-type": "application/json" };
 		if (auth !== null) headers.authorization = `Bearer ${auth}`;
-		const req = httpRequest({ method, hostname: u.hostname, port: u.port, path: u.pathname, headers }, (res) => {
+		const req = httpRequest({ method, hostname: u.hostname, port: u.port, path: u.pathname, headers, agent }, (res) => {
 			const chunks: Buffer[] = [];
 			const frames: StreamFrame[] = [];
 			const decoder = new TextDecoder();
