@@ -5,7 +5,9 @@
 // has: the filesystem (DEVELOPMENT_ONLY, one host) and an S3-compatible
 // bucket with its own credentials (the chart renders only this one). The
 // store is transport state of the sender; Control's dispatch record is the
-// ledger and never derives from it.
+// ledger and never derives from it. Every object of a call is addressed by
+// the call's scope (<kind>/<callId>/<tenantId>): a call id is unique per
+// tenant, never globally, so two tenants' calls never share an object.
 import { createHash } from "node:crypto";
 import { mkdir, open, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
@@ -18,7 +20,7 @@ import {
 	S3ServiceException,
 } from "@aws-sdk/client-s3";
 import type { Config } from "../config.js";
-import type { CallRecord, Settlement } from "../domain/call.js";
+import type { CallRecord, CallScope, Settlement } from "../domain/call.js";
 
 export class PreconditionFailed extends Error {}
 
@@ -45,11 +47,22 @@ export interface ObjectStore {
 	describe(): string;
 }
 
-const keyPattern = /^[a-z]+\/[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+// A key is a kind and one or two contract ids (the call's scope is two: the
+// call id, then the tenant); a list prefix is a kind alone or a kind and the
+// first id. Ids never contain "/", so the segments are unambiguous.
+const idSegment = "[A-Za-z0-9][A-Za-z0-9._:-]{0,127}";
+const keyPattern = new RegExp(`^[a-z]+/${idSegment}(/${idSegment})?$`);
+const prefixPattern = new RegExp(`^[a-z]+/(${idSegment}/)?$`);
 
 function checkKey(key: string): void {
 	if (!keyPattern.test(key) || key.split("/").some((s) => s === "." || s === "..")) {
 		throw new Error(`invalid store key ${JSON.stringify(key)}`);
+	}
+}
+
+function checkPrefix(prefix: string): void {
+	if (!prefixPattern.test(prefix) || prefix.split("/").some((s) => s === "." || s === "..")) {
+		throw new Error(`invalid list prefix ${JSON.stringify(prefix)}`);
 	}
 }
 
@@ -120,15 +133,15 @@ export class FilesystemStore implements ObjectStore {
 	}
 
 	async list(prefix: string): Promise<string[]> {
-		if (!/^[a-z]+\/$/.test(prefix)) throw new Error(`invalid list prefix ${JSON.stringify(prefix)}`);
+		checkPrefix(prefix);
 		const dir = path.join(this.dir, prefix);
 		try {
-			const names = await readdir(dir);
+			const entries = await readdir(dir, { recursive: true, withFileTypes: true });
 			const out: string[] = [];
-			for (const n of names) {
-				if (n.endsWith(".tmp")) continue;
-				const st = await stat(path.join(dir, n));
-				if (st.isFile()) out.push(prefix + n);
+			for (const e of entries) {
+				if (!e.isFile() || e.name.endsWith(".tmp")) continue;
+				const rel = path.relative(dir, path.join(e.parentPath, e.name));
+				out.push(prefix + rel.split(path.sep).join("/"));
 			}
 			return out.sort();
 		} catch (err) {
@@ -216,7 +229,7 @@ export class S3Store implements ObjectStore {
 	}
 
 	async list(prefix: string): Promise<string[]> {
-		if (!/^[a-z]+\/$/.test(prefix)) throw new Error(`invalid list prefix ${JSON.stringify(prefix)}`);
+		checkPrefix(prefix);
 		const out: string[] = [];
 		let token: string | undefined;
 		do {
@@ -273,6 +286,7 @@ export function newObjectStore(cfg: Config): ObjectStore {
  */
 export interface NativeEvidence {
 	callId: string;
+	tenantId: string;
 	dispatchId: string;
 	routeId: string;
 	capturedAt: string;
@@ -297,28 +311,56 @@ export interface PendingMarker {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-/** Typed access to the objects of the Proxy. */
+type Kind = "calls" | "evidence" | "pending" | "cancel";
+
+function keyOf(kind: Kind, scope: CallScope): string {
+	return `${kind}/${scope.callId}/${scope.tenantId}`;
+}
+
+/** The scope a key of the kind addresses; undefined for a key of another layout (never acted on). */
+function scopeOfKey(kind: Kind, key: string): CallScope | undefined {
+	const parts = key.split("/");
+	if (parts.length !== 3 || parts[0] !== kind || !parts[1] || !parts[2]) return undefined;
+	return { callId: parts[1], tenantId: parts[2] };
+}
+
+/** The evidence key of a scope: what a record's evidenceRef names once the record took the settlement from it. */
+export function evidenceKeyOf(scope: CallScope): string {
+	return keyOf("evidence", scope);
+}
+
+/** Typed access to the objects of the Proxy, every one addressed by the call's scope. */
 export class CallStore {
 	constructor(readonly objects: ObjectStore) {}
 
-	async read(callId: string): Promise<{ record: CallRecord; version: string } | undefined> {
-		const o = await this.objects.get(`calls/${callId}`);
+	async read(scope: CallScope): Promise<{ record: CallRecord; version: string } | undefined> {
+		const o = await this.objects.get(keyOf("calls", scope));
 		if (!o) return undefined;
 		return { record: JSON.parse(decoder.decode(o.body)) as CallRecord, version: o.version };
 	}
 
-	/** Creates the record; PreconditionFailed when the call is already recorded. */
+	/** Creates the record; PreconditionFailed when the call is already recorded under its scope. */
 	async create(record: CallRecord): Promise<string> {
-		return this.objects.put(`calls/${record.callId}`, encoder.encode(JSON.stringify(record)), { ifNoneMatch: true });
+		return this.objects.put(keyOf("calls", record), encoder.encode(JSON.stringify(record)), { ifNoneMatch: true });
 	}
 
 	/** Replaces the record read at `version`; PreconditionFailed when another writer moved it. */
 	async update(record: CallRecord, version: string): Promise<string> {
-		return this.objects.put(`calls/${record.callId}`, encoder.encode(JSON.stringify(record)), { ifMatch: version });
+		return this.objects.put(keyOf("calls", record), encoder.encode(JSON.stringify(record)), { ifMatch: version });
+	}
+
+	/** The scopes recorded under a call id (one per tenant that used it): what a query by call id alone must choose from. */
+	async listCalls(callId: string): Promise<CallScope[]> {
+		const out: CallScope[] = [];
+		for (const key of await this.objects.list(`calls/${callId}/`)) {
+			const scope = scopeOfKey("calls", key);
+			if (scope) out.push(scope);
+		}
+		return out;
 	}
 
 	async writeEvidence(evidence: NativeEvidence): Promise<string> {
-		const key = `evidence/${evidence.callId}`;
+		const key = evidenceKeyOf(evidence);
 		try {
 			await this.objects.put(key, encoder.encode(JSON.stringify(evidence)), { ifNoneMatch: true });
 		} catch (err) {
@@ -328,22 +370,23 @@ export class CallStore {
 		return key;
 	}
 
-	async readEvidence(callId: string): Promise<NativeEvidence | undefined> {
-		const o = await this.objects.get(`evidence/${callId}`);
+	async readEvidence(scope: CallScope): Promise<NativeEvidence | undefined> {
+		const o = await this.objects.get(evidenceKeyOf(scope));
 		return o ? (JSON.parse(decoder.decode(o.body)) as NativeEvidence) : undefined;
 	}
 
-	async markPending(callId: string, deadline: string): Promise<void> {
+	/** Creates the pending marker if absent (an existing marker is left as it is). */
+	async markPending(scope: CallScope, deadline: string): Promise<void> {
 		const marker: PendingMarker = { deadline };
 		try {
-			await this.objects.put(`pending/${callId}`, encoder.encode(JSON.stringify(marker)), { ifNoneMatch: true });
+			await this.objects.put(keyOf("pending", scope), encoder.encode(JSON.stringify(marker)), { ifNoneMatch: true });
 		} catch (err) {
 			if (!(err instanceof PreconditionFailed)) throw err;
 		}
 	}
 
-	async readPending(callId: string): Promise<PendingMarker | undefined> {
-		const o = await this.objects.get(`pending/${callId}`);
+	async readPending(scope: CallScope): Promise<PendingMarker | undefined> {
+		const o = await this.objects.get(keyOf("pending", scope));
 		if (!o) return undefined;
 		try {
 			const parsed = JSON.parse(decoder.decode(o.body)) as PendingMarker;
@@ -353,17 +396,22 @@ export class CallStore {
 		}
 	}
 
-	async clearPending(callId: string): Promise<void> {
-		await this.objects.delete(`pending/${callId}`);
+	async clearPending(scope: CallScope): Promise<void> {
+		await this.objects.delete(keyOf("pending", scope));
 	}
 
-	async listPending(): Promise<string[]> {
-		return (await this.objects.list("pending/")).map((k) => k.slice("pending/".length));
+	async listPending(): Promise<CallScope[]> {
+		const out: CallScope[] = [];
+		for (const key of await this.objects.list("pending/")) {
+			const scope = scopeOfKey("pending", key);
+			if (scope) out.push(scope);
+		}
+		return out;
 	}
 
-	async requestCancel(callId: string, at: string): Promise<void> {
+	async requestCancel(scope: CallScope, at: string): Promise<void> {
 		try {
-			await this.objects.put(`cancel/${callId}`, encoder.encode(JSON.stringify({ requestedAt: at })), {
+			await this.objects.put(keyOf("cancel", scope), encoder.encode(JSON.stringify({ requestedAt: at })), {
 				ifNoneMatch: true,
 			});
 		} catch (err) {
@@ -371,8 +419,8 @@ export class CallStore {
 		}
 	}
 
-	async cancelRequested(callId: string): Promise<string | undefined> {
-		const o = await this.objects.get(`cancel/${callId}`);
+	async cancelRequested(scope: CallScope): Promise<string | undefined> {
+		const o = await this.objects.get(keyOf("cancel", scope));
 		if (!o) return undefined;
 		return (JSON.parse(decoder.decode(o.body)) as { requestedAt: string }).requestedAt;
 	}
