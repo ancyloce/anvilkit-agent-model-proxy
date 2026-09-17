@@ -15,29 +15,15 @@ import { Ajv, type ValidateFunction } from "ajv";
 import { parse as parseYaml } from "yaml";
 
 export type Schemas = components["schemas"];
-export type ModelCallRequest = Omit<Schemas["ModelCallRequest"], "messages"> & { messages: Message[] };
+export type ModelCallRequest = Schemas["ModelCallRequest"];
 export type ModelCall = Schemas["ModelCall"];
 export type StreamFrame = Schemas["StreamFrame"];
 export type Usage = Schemas["Usage"];
 export type ErrorEnvelope = Schemas["ErrorEnvelope"];
 export type ErrorCode = ErrorEnvelope["error"]["code"];
 export type ExecutionBinding = Schemas["ExecutionBinding"];
-/**
- * One tool call of an assistant message replayed to the model (the
- * `Message.toolCalls` member of the contract): the call id and name the
- * model produced and its arguments as the JSON object text of the
- * tool_call frame.
- */
-export interface MessageToolCall {
-	toolCallId: string;
-	name: string;
-	arguments: string;
-}
-// The generated consumer of the pinned contracts commit (972e11c) predates
-// the `toolCalls` member; the contract document this service validates
-// against carries it. The member is declared here until the dependency is
-// bumped to the commit that generates it.
-export type Message = Schemas["Message"] & { toolCalls?: MessageToolCall[] };
+export type Message = Schemas["Message"];
+export type MessageToolCall = Schemas["MessageToolCall"];
 export type ToolDefinition = Schemas["ToolDefinition"];
 export type ModelCallState = ModelCall["state"];
 export type Outcome = NonNullable<StreamFrame["outcome"]>;
