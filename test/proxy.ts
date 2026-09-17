@@ -67,8 +67,8 @@ export function proxyConfig(o: ProxyOptions): Config {
 		.replace("    enabled: false\n", "    enabled: true\n")
 		.replace("base_url: http://127.0.0.1:1/v1", `base_url: ${o.upstreamUrl}/v1`)
 		.replace(
-			"  retry_initial: 1s\n  retry_max_interval: 30s\n  sweep_interval: 30s\n  reclaim_grace: 30s\n  late_settlement_window: 1h",
-			"  retry_initial: 50ms\n  retry_max_interval: 200ms\n  sweep_interval: 1s\n  reclaim_grace: 500ms\n  late_settlement_window: 1500ms",
+			"  retry_initial: 1s\n  retry_max_interval: 30s\n  sweep_interval: 30s\n  reclaim_grace: 30s",
+			"  retry_initial: 50ms\n  retry_max_interval: 200ms\n  sweep_interval: 1s\n  reclaim_grace: 500ms",
 		)
 		.replace(
 			"    initial: 500ms\n    max_interval: 5s\n    max_attempts: 5",

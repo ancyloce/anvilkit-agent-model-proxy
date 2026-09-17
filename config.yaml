@@ -55,15 +55,13 @@ observation:
   # ObserveDispatch resubmission of a recorded observation under its original
   # source and sequence; the sweep resubmits pending observations and
   # reclaims a send whose deadline plus grace passed without evidence as
-  # unknown (never as sent-nothing, never by resending). A reclaimed call's
-  # pending marker stays for the late-settlement window, so evidence the
-  # lost sender persisted after the reclaim is still completed from — the
-  # original settlement and usage, one supplemental observation, no send.
+  # unknown (never as sent-nothing, never by resending) and keeps watching
+  # a reclaimed call for the lost sender's evidence, however late it lands —
+  # the original settlement and usage, one supplemental observation, no send.
   retry_initial: 1s
   retry_max_interval: 30s
   sweep_interval: 30s
   reclaim_grace: 30s
-  late_settlement_window: 1h
 # routes: the reviewed model routes. A route is served only when it is
 # enabled here, its credential variable is set, and its api is one of the
 # implemented and inspected SDK paths (openai-completions in this build).
