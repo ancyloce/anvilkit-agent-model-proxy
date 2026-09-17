@@ -7,7 +7,11 @@
 // store is transport state of the sender; Control's dispatch record is the
 // ledger and never derives from it. Every object of a call is addressed by
 // the call's scope (<kind>/<callId>/<tenantId>): a call id is unique per
-// tenant, never globally, so two tenants' calls never share an object.
+// tenant, never globally, so two tenants' calls never share an object. The
+// backends offer conditional creates and replaces but no conditional
+// delete (MinIO ignores If-Match on DeleteObject), so nothing whose loss
+// would hide evidence is ever protected by a delete alone: a reclaimed
+// send keeps a `reclaimed` index entry until its evidence is taken.
 import { createHash } from "node:crypto";
 import { mkdir, open, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
@@ -302,7 +306,13 @@ export interface NativeEvidence {
 	settlement: Settlement;
 }
 
-/** The pending marker of a call: written before its record, so the sweep discovers the call however early its opener died. */
+/**
+ * The pending marker of a call: written before its record, so the sweep
+ * discovers the call however early its opener died. Released once nothing
+ * more is owed through it (see CallService.releasable); a send reclaimed as
+ * unknown is watched for late evidence through the `reclaimed` index
+ * instead, which only its taken evidence removes.
+ */
 export interface PendingMarker {
 	/** The call's deadline; an orphan marker (no record) is cleared only after it plus the reclaim grace. */
 	deadline?: string;
@@ -311,7 +321,7 @@ export interface PendingMarker {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-type Kind = "calls" | "evidence" | "pending" | "cancel";
+type Kind = "calls" | "evidence" | "pending" | "cancel" | "reclaimed";
 
 function keyOf(kind: Kind, scope: CallScope): string {
 	return `${kind}/${scope.callId}/${scope.tenantId}`;
@@ -401,9 +411,37 @@ export class CallStore {
 	}
 
 	async listPending(): Promise<CallScope[]> {
+		return this.listScopes("pending");
+	}
+
+	/**
+	 * Indexes a send reclaimed as unknown without evidence (create-only): the
+	 * sweep watches the entry for the lost sender's evidence, however late it
+	 * lands and whatever became of the pending marker, and removes it only
+	 * once the record took that evidence — the one state nothing can follow.
+	 */
+	async markReclaimed(scope: CallScope): Promise<void> {
+		try {
+			await this.objects.put(keyOf("reclaimed", scope), encoder.encode(JSON.stringify({ callId: scope.callId })), {
+				ifNoneMatch: true,
+			});
+		} catch (err) {
+			if (!(err instanceof PreconditionFailed)) throw err;
+		}
+	}
+
+	async clearReclaimed(scope: CallScope): Promise<void> {
+		await this.objects.delete(keyOf("reclaimed", scope));
+	}
+
+	async listReclaimed(): Promise<CallScope[]> {
+		return this.listScopes("reclaimed");
+	}
+
+	private async listScopes(kind: Kind): Promise<CallScope[]> {
 		const out: CallScope[] = [];
-		for (const key of await this.objects.list("pending/")) {
-			const scope = scopeOfKey("pending", key);
+		for (const key of await this.objects.list(`${kind}/`)) {
+			const scope = scopeOfKey(kind, key);
 			if (scope) out.push(scope);
 		}
 		return out;
