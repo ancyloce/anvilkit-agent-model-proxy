@@ -30,6 +30,21 @@ export function toolSchemaDigest(inputSchema: Record<string, unknown>): string {
 
 export type CallState = ModelCallState;
 
+/**
+ * The identity of a call in this Proxy: Control's dispatch identity
+ * (tenant, owner, callId) without the constant owner. Call ids are unique
+ * per tenant, never globally; every object of a call (record, evidence,
+ * pending marker, cancel intent) is addressed by this scope.
+ */
+export interface CallScope {
+	tenantId: string;
+	callId: string;
+}
+
+export function scopeOf(r: CallScope): CallScope {
+	return { tenantId: r.tenantId, callId: r.callId };
+}
+
 /** One outcome/usage observation the Proxy owes Control (idempotent by source and sequence). */
 export interface Observation {
 	source: string;
@@ -68,6 +83,13 @@ export interface CallRecord {
 	frames: StreamFrame[];
 	observations: Observation[];
 	cancelRequestedAt?: string;
+	/**
+	 * When a sweep reclaimed the send as unknown (SENDER_LOST) without
+	 * evidence: the pending marker stays for the late-settlement window
+	 * after this instant so the sender's evidence, landing late, is still
+	 * discovered by any instance.
+	 */
+	reclaimedAt?: string;
 }
 
 /**
