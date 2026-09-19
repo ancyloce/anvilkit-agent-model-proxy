@@ -67,6 +67,9 @@ observation:
 # implemented and inspected SDK paths (openai-completions in this build).
 # Prices, caps and commercial authority stay with Control (ENV-06/ENV-07);
 # limits here bound what one call may declare or receive on the route.
+# max_exposure is the reviewed full-route exposure reserved for every send,
+# regardless of the caller's declared amount. Before enabling a paid route,
+# review it against the provider's maximum accepted input/output and prices.
 # controlled-openai-v1 is the countable controlled upstream of the P11
 # scenarios (an OpenAI-compatible completions double); it is enabled only by
 # the scenarios' own configuration copies. No real provider route exists in

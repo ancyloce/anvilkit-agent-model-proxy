@@ -34,7 +34,7 @@ COPY --from=build /src/dist ./dist
 COPY package.json ./package.json
 COPY config.yaml /etc/anvilkit/anvilkit-agent-model-proxy/config.yaml
 COPY --from=contracts openapi/model-proxy.yaml /anvilkit/contracts/openapi/model-proxy.yaml
-# openapi/model-proxy.yaml of contracts commit 1e7cb5d5c53752c2337af1655ee5c2d20212c47e
+# openapi/model-proxy.yaml of contracts commit ffe05d5511bd646b8b6ae483616c3a9d26373404 (tag go/v0.1.3)
 # (line endings normalized: a CRLF checkout carries the same document).
 ARG CONTRACT_SHA256=d2d686d11ea503485b8ffa89cb7d4a738c40f02a0435be935dd5f04a3b453450
 RUN test "$(tr -d '\r' < /anvilkit/contracts/openapi/model-proxy.yaml | sha256sum | cut -d' ' -f1)" = "$CONTRACT_SHA256" \
