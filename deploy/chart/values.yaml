@@ -81,6 +81,11 @@ store:
 # key holding the provider credential. A route without an entry here is
 # declared but not served.
 routeCredentials: []
+# Optional CSI volume: credential files are readable only by this workload.
+credentialCSI:
+  secretProviderClass: ""
+  files: [] # [{env: ANVILKIT_MODEL_PROXY_CREDENTIAL_DEEPSEEK, name: deepseek-api-key}]
+
 #  - env: ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1
 #    secret:
 #      name: model-proxy-route-controlled

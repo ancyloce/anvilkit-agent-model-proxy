@@ -82,6 +82,10 @@ spec:
                   name: {{ .secret.name }}
                   key: {{ .secret.key }}
             {{- end }}
+            {{- range .Values.credentialCSI.files }}
+            - name: {{ printf "%s_FILE" .env }}
+              value: {{ printf "/var/run/secrets/anvilkit/provider/%s" .name | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.listen.port }}
@@ -113,6 +117,11 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            {{- if .Values.credentialCSI.secretProviderClass }}
+            - name: provider
+              mountPath: /var/run/secrets/anvilkit/provider
+              readOnly: true
+            {{- end }}
             - name: config
               mountPath: /etc/anvilkit/anvilkit-agent-model-proxy
               readOnly: true
@@ -131,6 +140,14 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
+        {{- if .Values.credentialCSI.secretProviderClass }}
+        - name: provider
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ .Values.credentialCSI.secretProviderClass | quote }}
+        {{- end }}
         - name: config
           configMap:
             name: {{ include "anvilkit-agent-model-proxy.fullname" . }}
