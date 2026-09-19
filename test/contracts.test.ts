@@ -65,6 +65,26 @@ describe("contract boundary", () => {
 		expect(() =>
 			contract.parse("StreamFrame", '{"callId":"c","sequence":"0","type":"admitted"} {"callId":"c"}'),
 		).toThrow(/malformed JSON/);
+		// A name spelled by an escape is the same name; the same names in
+		// different objects (siblings, nested, array members) are no repeat.
+		expect(() =>
+			contract.parse(
+				"Usage",
+				'{"inputUnits":"1","\\u0069nputUnits":"1","outputUnits":"0","reasoningUnits":"0","cachedInputUnits":"0"}',
+			),
+		).toThrow(/malformed JSON: Duplicate key 'inputUnits'/);
+		expect(() =>
+			contract.parse(
+				"StreamFrame",
+				'{"callId":"c","sequence":"1","type":"usage","usage":{"inputUnits":"1","outputUnits":"1","reasoningUnits":"0","cachedInputUnits":"0"},"toolCall":{"toolCallId":"t","name":"n","argumentsDigest":"sha256:0dc7fa9db7237a2b5c96f70f59bb00f73bb86a0ca5554e91c312f9ada26e18b3"}}',
+			),
+		).not.toThrow();
+		expect(
+			contract.parse<{ messages: { role: string; content: string }[] }>(
+				"ModelCallRequest",
+				'{"callId":"c","binding":{"tenantId":"t","operationId":"o","attemptId":"a","executionEpoch":"1"},"routeId":"r","requestDigest":"sha256:0dc7fa9db7237a2b5c96f70f59bb00f73bb86a0ca5554e91c312f9ada26e18b3","messages":[{"role":"user","content":"x"},{"role":"user","content":"x"}],"maxOutputTokens":1,"maxExposure":{"currency":"USD","amount":"1"},"deadline":"2026-09-17T00:00:00Z"}',
+			).messages,
+		).toHaveLength(2);
 		expect(() => contract.parse("ModelCallRequest", '{"maxOutputTokens":1e400}')).toThrow(/malformed/);
 		expect(() =>
 			contract.parse("StreamFrame", '{"callId":"c","sequence":"1","type":"text","text":"a","apiKey":"x"}'),

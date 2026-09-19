@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ConfigError, disabled, parseDuration, routeDisabledReasons } from "../src/config.js";
 import { checkedInConfig, configFrom } from "./helpers.js";
@@ -122,4 +125,22 @@ describe("configuration", () => {
 		expect(() => parseDuration("1.5s", "k")).toThrow(/not a duration/);
 		expect(() => parseDuration("10", "k")).toThrow(/not a duration/);
 	});
+});
+
+it("loads a CSI credential file and refuses ambiguous sources without disclosing content", () => {
+	const dir = mkdtempSync(join(tmpdir(), "proxy-credential-")),
+		file = join(dir, "api-key");
+	try {
+		writeFileSync(file, "fixture-file-credential\n", { mode: 0o400 });
+		const env = { ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1_FILE: file };
+		expect(configFrom(base, env).credentials.get("controlled-openai-v1")).toBe("fixture-file-credential");
+		expect(() => configFrom(base, { ...env, ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1: "other" })).toThrow(
+			/both/,
+		);
+		expect(() =>
+			configFrom(base, { ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1_FILE: join(dir, "missing") }),
+		).toThrow(/cannot read credential file/);
+	} finally {
+		rmSync(dir, { recursive: true });
+	}
 });

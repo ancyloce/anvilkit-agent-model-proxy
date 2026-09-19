@@ -56,6 +56,18 @@ describe("controlled calls", () => {
 	const evidenceOf = (callId: string) =>
 		JSON.parse(readFileSync(path.join(proxy.storeDir, "evidence", callId, "tenant_a"), "utf8"));
 
+	it("reserves the reviewed full route exposure even when the candidate declares one unit", async () => {
+		up.next({ kind: "stream", text: ["bounded"] });
+		const callId = id("underdeclared");
+		const req = requestBody(callId, { maxExposure: { currency: "USD", amount: "1" } });
+		const r = await call(proxy.url, "POST", "/api/v1/model-calls", req);
+		expect(r.status, r.text).toBe(200);
+		expect(control.admits.find((a) => a.callId === callId)?.maxExposure).toMatchObject({
+			currency: "USD",
+			amount: "1000000",
+		});
+	});
+
 	it("a normal call: one admission, one physical send, bounded frames, evidence and one observation with native usage", async () => {
 		up.next({
 			kind: "stream",
@@ -1147,6 +1159,7 @@ describe("two Proxy instances on one store", () => {
 		});
 	};
 	const markerOf = (callId: string, tenantId = "tenant_a") => path.join(a.storeDir, "pending", callId, tenantId);
+	const reclaimedOf = (callId: string, tenantId = "tenant_a") => path.join(a.storeDir, "reclaimed", callId, tenantId);
 	const untilGone = async (file: string) => {
 		for (let i = 0; i < 100 && existsSync(file); i++) await new Promise((r) => setTimeout(r, 50));
 	};
@@ -1217,7 +1230,7 @@ describe("two Proxy instances on one store", () => {
 		await a.store.clearPending(young);
 	});
 
-	it("a send lost with its process is reclaimed as unknown by the sweep after the deadline, never resent; pending observations are resubmitted; the marker stays for the late-settlement window", async () => {
+	it("a send lost with its process is reclaimed as unknown by the sweep after the deadline, never resent; pending observations are resubmitted; the reclaimed index outlives the marker", async () => {
 		const callId = `call_lost_${Date.now()}`;
 		const scope = { tenantId: "tenant_a", callId };
 		fakeDispatch(callId, "tenant_a", "dsp_fake_lost");
@@ -1245,19 +1258,22 @@ describe("two Proxy instances on one store", () => {
 		);
 		expect(replay.status).toBe(409);
 		expect(up.receives.length).toBe(sends);
-		// The observation is submitted, yet the marker stays: the lost sender's
-		// evidence may still land. It goes once the late-settlement window passed.
+		// The observation submitted, the marker goes; the reclaimed index stays
+		// for the lost sender's evidence, however many sweeps pass without it.
+		await untilGone(markerOf(callId));
 		expect((await a.store.read(scope))?.record.observations.every((o) => o.submitted)).toBe(true);
-		expect(existsSync(markerOf(callId))).toBe(true);
-		await b.calls.sweep();
-		expect(existsSync(markerOf(callId))).toBe(true);
-		await new Promise((r) => setTimeout(r, a.cfg.observation.lateSettlementWindowMs + 100));
-		await b.calls.sweep();
+		expect(existsSync(markerOf(callId))).toBe(false);
+		expect(existsSync(reclaimedOf(callId))).toBe(true);
+		for (const instance of [a, b]) {
+			expect(await instance.calls.sweep()).toMatchObject({ completed: 0, reclaimed: 0, resubmitted: 0 });
+		}
+		expect(existsSync(reclaimedOf(callId))).toBe(true);
 		expect(existsSync(markerOf(callId))).toBe(false);
 		expect(control.byCall(callId)?.observations).toHaveLength(1);
+		expect(up.receives.length).toBe(sends);
 	});
 
-	it("evidence that lands after the reclaim, its sender lost before publishing, is completed by any instance's sweep: the actual settlement and usage under the original dispatch, no send; repeated sweeps and a lost observation receipt add no charge", async () => {
+	it("evidence that lands after the reclaim and after the marker went, its sender lost before writing the marker back or publishing, is completed by any instance's sweep: the actual settlement and usage under the original dispatch, no send; repeated sweeps and a lost observation receipt add no charge", async () => {
 		const callId = `call_late_${Date.now()}`;
 		const scope = { tenantId: "tenant_a", callId };
 		fakeDispatch(callId, "tenant_a", "dsp_fake_late");
@@ -1265,14 +1281,18 @@ describe("two Proxy instances on one store", () => {
 		await a.store.create(sendingRecord(callId, "tenant_a", "dsp_fake_late", past));
 		await a.store.markPending(scope, past);
 		const sends = up.receives.length;
-		// The sweep reclaims the send as unknown and submits that; Control retains the exposure.
+		// The sweep reclaims the send as unknown and submits that; Control
+		// retains the exposure; the marker is released, the index stays.
 		expect((await b.calls.sweep()).reclaimed).toBe(1);
 		for (let i = 0; i < 100 && !control.byCall(callId)?.observations.length; i++)
 			await new Promise((r) => setTimeout(r, 50));
 		expect(control.byCall(callId)?.state).toBe(DispatchState.DISPATCH_STATE_UNKNOWN);
-		// The sender, slow rather than dead, persists its evidence with the
-		// settlement and re-marks the call as the send path does — then dies
-		// before publishing the record.
+		await untilGone(markerOf(callId));
+		expect(existsSync(markerOf(callId))).toBe(false);
+		expect(existsSync(reclaimedOf(callId))).toBe(true);
+		// The sender, slow rather than dead until now, persists its evidence
+		// with the settlement — and is lost before it writes the marker back
+		// or publishes the record: nothing but the evidence object remains.
 		const usage = { inputUnits: "21", outputUnits: "5", reasoningUnits: "0", cachedInputUnits: "0" };
 		const frames: StreamFrame[] = [
 			{ callId, sequence: "0", type: "admitted" },
@@ -1296,13 +1316,15 @@ describe("two Proxy instances on one store", () => {
 			response: { status: 200, headers: {}, bodyBase64: "", bodyBytes: 0, bodyTruncated: false },
 			settlement: { outcome: "succeeded", usage, nativeReference: "chatcmpl-late", frames },
 		});
-		await a.store.markPending(scope, past);
+		expect(existsSync(markerOf(callId))).toBe(false);
 		// The other instance's sweep completes it; its first observation receipt is lost.
 		control.loseObserveAnswers = 1;
 		const swept = await a.calls.sweep();
 		expect(swept).toMatchObject({ completed: 1, reclaimed: 0 });
 		await untilGone(markerOf(callId));
+		await untilGone(reclaimedOf(callId));
 		expect(existsSync(markerOf(callId))).toBe(false);
+		expect(existsSync(reclaimedOf(callId))).toBe(false);
 		expect(up.receives.length).toBe(sends);
 		const rec = (await a.store.read(scope))?.record;
 		expect(rec).toMatchObject({
@@ -1335,7 +1357,8 @@ describe("two Proxy instances on one store", () => {
 		expect(control.byCall(callId)?.observations).toHaveLength(2);
 		expect(up.receives.length).toBe(sends);
 		// Evidence that establishes nothing more than the reclaim keeps the
-		// unknown exposure: no observation, and the marker is released.
+		// unknown exposure: no observation; the record takes the evidence, so
+		// the index goes (nothing can follow written-once evidence).
 		const vague = `call_vague_${Date.now()}`;
 		const vagueScope = { tenantId: "tenant_a", callId: vague };
 		fakeDispatch(vague, "tenant_a", "dsp_fake_vague");
@@ -1344,6 +1367,7 @@ describe("two Proxy instances on one store", () => {
 		expect((await b.calls.sweep()).reclaimed).toBe(1);
 		for (let i = 0; i < 100 && !control.byCall(vague)?.observations.length; i++)
 			await new Promise((r) => setTimeout(r, 50));
+		await untilGone(markerOf(vague));
 		await a.store.writeEvidence({
 			callId: vague,
 			tenantId: "tenant_a",
@@ -1367,14 +1391,15 @@ describe("two Proxy instances on one store", () => {
 				],
 			},
 		});
-		await a.store.markPending(vagueScope, past);
 		expect((await b.calls.sweep()).completed).toBe(1);
 		await untilGone(markerOf(vague));
+		await untilGone(reclaimedOf(vague));
 		expect((await a.store.read(vagueScope))?.record).toMatchObject({
 			state: "unknown",
 			errorCode: "UPSTREAM_ERROR",
 			evidenceRef: `evidence/${vague}/tenant_a`,
 		});
+		expect(existsSync(reclaimedOf(vague))).toBe(false);
 		expect(control.byCall(vague)?.observations).toHaveLength(1);
 		expect(control.byCall(vague)?.state).toBe(DispatchState.DISPATCH_STATE_UNKNOWN);
 		expect(up.receives.length).toBe(sends);
@@ -1406,6 +1431,11 @@ describe("two Proxy instances on one store", () => {
 			await new Promise((r) => setTimeout(r, 50));
 		expect((await a.store.read(scope))?.record).toMatchObject({ state: "unknown", errorCode: "SENDER_LOST" });
 		expect(control.byCall(callId)?.state).toBe(DispatchState.DISPATCH_STATE_UNKNOWN);
+		await untilGone(markerOf(callId));
+		expect(await a.calls.sweep()).toMatchObject({ completed: 0, reclaimed: 0, resubmitted: 0 });
+		expect(existsSync(reclaimedOf(callId))).toBe(false);
+		expect((await a.store.read(scope))?.record).toMatchObject({ state: "unknown", errorCode: "SENDER_LOST" });
+		expect(control.byCall(callId)?.observations).toHaveLength(1);
 	});
 
 	it("two tenants under one call id are two calls: each principal's own admission, send, record, evidence, cancel and settlement; neither reads, moves or replaces the other", async () => {
@@ -1485,6 +1515,153 @@ describe("two Proxy instances on one store", () => {
 		expect((await call(b.url, "POST", "/api/v1/model-calls", forC)).frames).toEqual(rc.frames);
 		expect(up.receives.length).toBe(sends + 3);
 		expect(await a.store.listCalls(callId)).toHaveLength(3);
+	});
+
+	it("a placeholder whose unknown observation was submitted and whose marker was released is taken over cleanly: the send is marked pending again and carries none of the placeholder's outcome state, no sweep releases it, the sender lost mid-settlement is reclaimed as unknown by the other instance, and its late evidence completes the original dispatch — one admission, one send", async () => {
+		// The duplicate's placeholder — its unknown observation already
+		// submitted, its marker already released — appears between the
+		// holder's read and its create (the store double writes it from the
+		// holder's own record, so caller, tenant, digests and dispatch match);
+		// the holder's evidence writes then fail until released: the sender
+		// alive but unable to settle, then "lost" past the deadline.
+		let armed = false;
+		let blockEvidence = false;
+		const wrap = (inner: ObjectStore): ObjectStore => ({
+			...inner,
+			get: (k) => inner.get(k),
+			delete: (k) => inner.delete(k),
+			list: (p) => inner.list(p),
+			qualify: () => inner.qualify(),
+			describe: () => inner.describe(),
+			put: async (key: string, body: Uint8Array, opts?: PutOptions) => {
+				if (armed && key.startsWith("calls/") && opts?.ifNoneMatch) {
+					const holder = JSON.parse(new TextDecoder().decode(body)) as Record<string, unknown>;
+					if (holder.state === "sending") {
+						armed = false;
+						const placeholder = {
+							...holder,
+							state: "unknown",
+							errorCode: "PERMISSION_LOST",
+							revision: 2,
+							frames: [
+								{ callId: holder.callId, sequence: "0", type: "admitted" },
+								{
+									callId: holder.callId,
+									sequence: "1",
+									type: "error",
+									outcome: "unknown",
+									errorCode: "PERMISSION_LOST",
+								},
+							],
+							observations: [
+								{
+									source: "model-proxy/d",
+									sequence: "2",
+									outcome: "unknown",
+									observedAt: new Date().toISOString(),
+									submitted: true,
+								},
+							],
+						};
+						await inner.put(key, new TextEncoder().encode(JSON.stringify(placeholder)), { ifNoneMatch: true });
+						await inner.delete(key.replace(/^calls\//, "pending/"));
+					}
+				}
+				if (blockEvidence && key.startsWith("evidence/")) throw new Error("store unavailable (scenario)");
+				return inner.put(key, body, opts);
+			},
+		});
+		const h = await startProxy({
+			upstreamUrl: up.url,
+			controlAddress: control.address,
+			instanceId: "h",
+			storeDir: a.storeDir,
+			objects: wrap,
+		});
+		try {
+			up.next({ kind: "stream", text: ["late"], usage: { prompt_tokens: 5, completion_tokens: 2 } });
+			const callId = `call_takeover_lost_${Date.now()}`;
+			const scope = { tenantId: "tenant_a", callId };
+			const deadline = new Date(Date.now() + 2500).toISOString();
+			const sends = up.receives.length;
+			armed = true;
+			blockEvidence = true;
+			const partial = await call(
+				h.url,
+				"POST",
+				"/api/v1/model-calls",
+				requestBody(callId, { deadline }),
+				token,
+				(f) => f.length >= 1,
+			);
+			expect(partial.frames[0]).toMatchObject({ type: "admitted" });
+			let rec = (await a.store.read(scope))?.record;
+			for (let i = 0; i < 100 && rec?.state !== "sending"; i++) {
+				await new Promise((r) => setTimeout(r, 50));
+				rec = (await a.store.read(scope))?.record;
+			}
+			const dispatchId = control.byCall(callId)?.dispatchId;
+			expect(dispatchId).toBeDefined();
+			// The take-over: the placeholder's outcome state is gone, its observation kept, the marker back.
+			expect(rec).toMatchObject({ state: "sending", dispatchId, principalId: "anvilkit-agent-workflow" });
+			expect(rec?.errorCode).toBeUndefined();
+			expect(rec?.frames).toEqual([]);
+			expect(rec?.observations).toEqual([expect.objectContaining({ source: "model-proxy/d", submitted: true })]);
+			expect(existsSync(markerOf(callId))).toBe(true);
+			expect(up.receives.length).toBe(sends + 1);
+			// The other instance's sweep before the deadline keeps the active send discoverable.
+			expect(await b.calls.sweep()).toMatchObject({ completed: 0, reclaimed: 0, resubmitted: 0 });
+			expect(existsSync(markerOf(callId))).toBe(true);
+			expect((await a.store.read(scope))?.record.state).toBe("sending");
+			// Past the deadline plus grace the sender, still unable to settle, counts as lost: reclaimed, unknown.
+			await new Promise((r) =>
+				setTimeout(r, Date.parse(deadline) + a.cfg.observation.reclaimGraceMs + 100 - Date.now()),
+			);
+			expect((await b.calls.sweep()).reclaimed).toBe(1);
+			for (let i = 0; i < 100 && !control.byCall(callId)?.observations.length; i++)
+				await new Promise((r) => setTimeout(r, 50));
+			expect((await a.store.read(scope))?.record).toMatchObject({
+				state: "unknown",
+				errorCode: "SENDER_LOST",
+				dispatchId,
+			});
+			expect(control.byCall(callId)?.state).toBe(DispatchState.DISPATCH_STATE_UNKNOWN);
+			expect(control.byCall(callId)?.observations).toHaveLength(1);
+			expect(existsSync(reclaimedOf(callId))).toBe(true);
+			// The sender's evidence lands late and supersedes the reclaim under the original dispatch.
+			blockEvidence = false;
+			for (let i = 0; i < 100 && (await a.store.read(scope))?.record.state !== "succeeded"; i++)
+				await new Promise((r) => setTimeout(r, 50));
+			const settled = (await a.store.read(scope))?.record;
+			expect(settled).toMatchObject({
+				state: "succeeded",
+				dispatchId,
+				usage: { inputUnits: "5", outputUnits: "2" },
+				evidenceRef: `evidence/${callId}/tenant_a`,
+			});
+			for (let i = 0; i < 100 && (control.byCall(callId)?.observations.length ?? 0) < 2; i++)
+				await new Promise((r) => setTimeout(r, 50));
+			expect(control.byCall(callId)?.observations.map((o) => o.outcome)).toEqual([
+				DispatchOutcome.DISPATCH_OUTCOME_UNKNOWN,
+				DispatchOutcome.DISPATCH_OUTCOME_SUCCEEDED,
+			]);
+			expect(control.byCall(callId)?.observations[1]).toMatchObject({
+				source: "model-proxy/h",
+				usage: { input: "5", output: "2" },
+			});
+			expect(control.admits.filter((x) => x.callId === callId)).toHaveLength(1);
+			expect(up.receives.length).toBe(sends + 1);
+			await untilGone(markerOf(callId));
+			for (const instance of [a, b]) {
+				expect(await instance.calls.sweep()).toMatchObject({ completed: 0, reclaimed: 0, resubmitted: 0 });
+			}
+			expect(existsSync(reclaimedOf(callId))).toBe(false);
+			expect(control.byCall(callId)?.observations).toHaveLength(2);
+			expect(up.receives.length).toBe(sends + 1);
+		} finally {
+			blockEvidence = false;
+			await h.close();
+		}
 	});
 
 	it("the permission holder takes over only the placeholder a duplicate recorded under the same identity; another identity's record under the scope is never overwritten", async () => {
