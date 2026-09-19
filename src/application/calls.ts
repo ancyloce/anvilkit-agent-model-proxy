@@ -350,7 +350,7 @@ export class CallService {
 			contentDigest,
 			binding: req.binding,
 			deadline: req.deadline,
-			maxExposure: req.maxExposure,
+			maxExposure: route.limits.maxExposure,
 			maxOutputTokens: req.maxOutputTokens,
 			dispatchId: admission.dispatchId,
 			state: "sending",
@@ -521,7 +521,9 @@ export class CallService {
 					routeId: route.id,
 					provider: route.provider,
 					model: route.model,
-					maxExposure: req.maxExposure,
+					// Reserve the reviewed full route bound. The candidate's
+					// declaration is never a cost estimate or a smaller reservation.
+					maxExposure: route.limits.maxExposure,
 					// The admission deadline is the request's at millisecond
 					// precision (the transport's Timestamp); callers state
 					// deadlines at that precision so the identity is exact.
@@ -1058,7 +1060,12 @@ export class CallService {
 	 * nothing.
 	 */
 	private async release(scope: CallScope, rec: CallRecord): Promise<void> {
-		if (rec.errorCode === "SENDER_LOST" && rec.evidenceRef === undefined) await this.d.store.markReclaimed(scope);
+		if (rec.reclaimedAt !== undefined) {
+			// A reclaimed send: indexed while its evidence is still awaited, the
+			// index dropped once the record took the evidence and owes nothing.
+			if (rec.evidenceRef === undefined) await this.d.store.markReclaimed(scope);
+			else await this.d.store.clearReclaimed(scope);
+		}
 		await this.d.store.clearPending(scope);
 		const again = await this.d.store.read(scope);
 		if (!again) return;

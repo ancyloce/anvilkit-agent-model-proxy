@@ -587,10 +587,22 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 	// credential variable no route declares is an unallowed override.
 	const declared = new Set(routes.map((r) => r.credentialEnv));
 	for (const name of credentialValues.keys()) {
-		if (!declared.has(name)) errors.push(`environment variable ${name} is not the credential of any configured route`);
+		if (!declared.has(name) && !(name.endsWith("_FILE") && declared.has(name.slice(0, -5))))
+			errors.push(`environment variable ${name} is not the credential of any configured route`);
 	}
 	for (const r of routes) {
-		const v = credentialValues.get(r.credentialEnv);
+		let v = credentialValues.get(r.credentialEnv);
+		const file = credentialValues.get(`${r.credentialEnv}_FILE`);
+		if (v !== undefined && file !== undefined)
+			errors.push(`${r.credentialEnv}: both direct and file credential sources supplied`);
+		else if (file !== undefined) {
+			try {
+				v = readFileSync(file, "utf8").trim();
+			} catch {
+				errors.push(`${r.credentialEnv}: cannot read credential file`);
+			}
+			if (!v) errors.push(`${r.credentialEnv}: credential file is empty`);
+		}
 		if (v) credentials.set(r.id, v);
 	}
 	const cfg: Config = {
