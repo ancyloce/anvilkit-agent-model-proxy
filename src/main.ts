@@ -14,6 +14,7 @@ import { CallService } from "./application/calls.js";
 import { type Config, disabled, load, routeDisabledReasons } from "./config.js";
 import { Contract } from "./contracts.js";
 import { jsonLogger } from "./log.js";
+import { Telemetry } from "./telemetry.js";
 import {
 	createHealthServer,
 	createServer,
@@ -57,10 +58,11 @@ export async function run(cfg: Config): Promise<void> {
 			});
 	}
 	let ready = false;
-	const server = createServer({ cfg, contract, calls, identity, log });
+	const telemetry = new Telemetry(cfg.telemetry, "anvilkit-agent-model-proxy");
+	const server = createServer({ cfg, contract, calls, identity, log, observer: telemetry });
 	server.requestTimeout = 0;
 	server.headersTimeout = cfg.http.requestHeaderTimeoutMs;
-	const health = createHealthServer(() => ready);
+	const health = createHealthServer(() => ready, telemetry.registry);
 	// The probe listener is up first: the kubelet's startup probe finds the
 	// process, /readyz answers 503 until the service is serving.
 	await listen(health, cfg.health.listen);
@@ -99,6 +101,7 @@ export async function run(cfg: Config): Promise<void> {
 	});
 	health.close();
 	control.close();
+	await telemetry.shutdown().catch((err) => log.warn("span flush failed", { error: String(err) }));
 }
 
 function listen(server: import("node:http").Server, address: string): Promise<void> {
