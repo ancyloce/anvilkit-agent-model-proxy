@@ -6,7 +6,9 @@ metadata:
   labels:
     {{- include "anvilkit-agent-model-proxy.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.autoscaling.enabled }}
   replicas: {{ .Values.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "anvilkit-agent-model-proxy.selectorLabels" . | nindent 6 }}
@@ -55,6 +57,10 @@ spec:
               value: {{ printf "%s:%d" .Values.listen.address (int .Values.listen.port) | quote }}
             - name: ANVILKIT_MODEL_PROXY_HEALTH_LISTEN
               value: {{ printf "0.0.0.0:%d" (int .Values.health.port) | quote }}
+            {{- if .Values.telemetry.otlpEndpoint }}
+            - name: ANVILKIT_MODEL_PROXY_TELEMETRY_OTLP_ENDPOINT
+              value: {{ .Values.telemetry.otlpEndpoint | quote }}
+            {{- end }}
             - name: ANVILKIT_MODEL_PROXY_CONTROL_ADDRESS
               value: {{ .Values.control.address | quote }}
             {{- if eq .Values.identity.mode "development" }}

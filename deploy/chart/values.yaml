@@ -16,6 +16,16 @@ image:
 imagePullSecrets: []
 replicaCount: 2
 
+# HorizontalPodAutoscaler (autoscaling/v2). Off unless the environment enables
+# it with an explicit maxReplicas: the maximum is bounded by downstream caps
+# and the database connection budget (deploy/gitops/lock.yaml), never a chart
+# default. While enabled the Deployment leaves replicas to the autoscaler.
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 0
+  targetCPUUtilizationPercentage: 70
+
 serviceAccount:
   create: true
   name: ""
@@ -208,3 +218,9 @@ tolerations: []
 affinity: {}
 podAnnotations: {}
 podLabels: {}
+
+# Telemetry placement (P23): the collector's OTLP/HTTP base URL for spans
+# (ANVILKIT_MODEL_PROXY_TELEMETRY_OTLP_ENDPOINT); empty disables it. The metrics are on
+# the health listener's /metrics; scraping is the environment's pod annotations.
+telemetry:
+  otlpEndpoint: ""

@@ -1,0 +1,31 @@
+{{- if .Values.autoscaling.enabled }}
+{{- /* The environment supplies an explicit maximum: it is bounded by the
+downstream caps and the database connection budget of the deployment lock,
+so the chart has no default for it. Two replicas are the HA floor. */}}
+{{- if lt (int .Values.autoscaling.minReplicas) 2 }}
+{{- fail "autoscaling.minReplicas must be at least 2" }}
+{{- end }}
+{{- if lt (int .Values.autoscaling.maxReplicas) (int .Values.autoscaling.minReplicas) }}
+{{- fail "autoscaling.maxReplicas must be set and not below autoscaling.minReplicas" }}
+{{- end }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "anvilkit-agent-model-proxy.fullname" . }}
+  labels:
+    {{- include "anvilkit-agent-model-proxy.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "anvilkit-agent-model-proxy.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}

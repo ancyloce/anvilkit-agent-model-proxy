@@ -18,7 +18,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/component: model-proxy
 app.kubernetes.io/part-of: anvilkit
-helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end -}}
 
 {{- define "anvilkit-agent-model-proxy.selectorLabels" -}}
