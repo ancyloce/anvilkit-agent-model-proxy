@@ -12,6 +12,7 @@
 // no listener or timer. The probes (/healthz, /readyz) live on a plaintext
 // listener of their own: the kubelet presents no client certificate, so
 // they never share the mTLS business listener.
+
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
@@ -19,11 +20,13 @@ import { createServer as createHttpServer, type IncomingMessage, type Server, ty
 import { createServer as createHttpsServer } from "node:https";
 import type { TLSSocket } from "node:tls";
 import { encode, encodeComment } from "eventsource-encoder";
+import type { Registry } from "prom-client";
 import { CallError, type CallService, type Principal, statusOf } from "../application/calls.js";
 import type { Config } from "../config.js";
 import type { Contract, ErrorCode, ErrorEnvelope, ModelCallRequest, StreamFrame } from "../contracts.js";
 import { ContractViolation } from "../contracts.js";
 import type { Logger } from "../log.js";
+import { type RequestObserver, routeOf } from "../telemetry.js";
 
 export interface Identity {
 	authenticate(req: IncomingMessage): Principal | undefined;
@@ -99,6 +102,8 @@ export interface HttpDeps {
 	calls: CallService;
 	identity: Identity;
 	log: Logger;
+	/** Records a span and the metrics of every business request (src/telemetry.ts). */
+	observer?: RequestObserver;
 }
 
 function requestId(): string {
@@ -127,6 +132,11 @@ const callPath = /^\/api\/v1\/model-calls\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})(\
 /** The business listener: plaintext under the development identity, TLS with mandatory client certificates under mtls. */
 export function createServer(d: HttpDeps): Server {
 	const handler = (req: IncomingMessage, res: ServerResponse) => {
+		if (d.observer) {
+			const pathname = new URL(req.url ?? "/", "http://proxy").pathname;
+			const done = d.observer.request(req.method ?? "GET", routeOf(pathname), req.headers);
+			res.once("close", () => done(res.statusCode));
+		}
 		void handle(d, req, res);
 	};
 	if (d.cfg.identity.mode === "mtls") {
@@ -148,12 +158,20 @@ export function createServer(d: HttpDeps): Server {
 
 /**
  * The probe listener: GET /healthz answers while the process runs, GET
- * /readyz while the service accepts calls; nothing else is served and no
- * identity is checked, so it must not be exposed beyond the Pod's probes.
+ * /readyz while the service accepts calls, GET /metrics the request and
+ * process metrics when given; nothing else is served and no identity is
+ * checked, so it must not be exposed beyond the Pod (probes and scraping).
  */
-export function createHealthServer(ready: () => boolean): Server {
+export function createHealthServer(ready: () => boolean, metrics?: Registry): Server {
 	return createHttpServer((req, res) => {
 		const url = new URL(req.url ?? "/", "http://proxy");
+		if (metrics && req.method === "GET" && url.pathname === "/metrics") {
+			void metrics.metrics().then(
+				(body) => res.writeHead(200, { "content-type": metrics.contentType, "cache-control": "no-store" }).end(body),
+				() => res.writeHead(500).end(),
+			);
+			return;
+		}
 		if (req.method === "GET" && url.pathname === "/healthz") {
 			res.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" }).end("ok");
 			return;
