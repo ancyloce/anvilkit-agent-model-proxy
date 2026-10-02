@@ -29,6 +29,10 @@ RUN pnpm install --frozen-lockfile --ignore-scripts --prod
 # mounting one at the path named by ANVILKIT_MODEL_PROXY_CONFIG.
 FROM node:24.19.0-bookworm-slim@sha256:a9f5f7c91a432850b2a8a7797adf5eadb6c733ceed61167806cee7ea7fbc29df
 WORKDIR /anvilkit/model-proxy
+# The runtime runs node only: the base image's npm, npx and corepack are
+# removed so their bundled packages (and their advisories) are not shipped.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
+      /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
 COPY --from=build /src/node_modules ./node_modules
 COPY --from=build /src/dist ./dist
 COPY package.json ./package.json
