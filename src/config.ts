@@ -70,8 +70,10 @@ export interface Config {
 		slowConsumerGraceMs: number;
 		shutdownTimeoutMs: number;
 	};
-	/** The plaintext probe listener: /healthz and /readyz only, no identity, no business route (the kubelet presents no client certificate). */
+	/** The plaintext probe listener: /healthz, /readyz and /metrics only, no identity, no business route (the kubelet presents no client certificate). */
 	health: { listen: string };
+	/** Spans over OTLP/HTTP to the collector when placed (none otherwise), sampled at sampleRatio. */
+	telemetry: { otlpEndpoint: string; sampleRatio: number };
 	identity: {
 		mode: IdentityMode;
 		owner: string;
@@ -138,6 +140,7 @@ const envOverrides: Record<string, string> = {
 	ANVILKIT_MODEL_PROXY_STORE_S3_ACCESS_KEY_ID: "store.s3.access_key_id",
 	ANVILKIT_MODEL_PROXY_STORE_S3_SECRET_ACCESS_KEY: "store.s3.secret_access_key",
 	ANVILKIT_MODEL_PROXY_CONTRACTS_DIR: "contracts.dir",
+	ANVILKIT_MODEL_PROXY_TELEMETRY_OTLP_ENDPOINT: "telemetry.otlp_endpoint",
 };
 
 // Keys that are secrets or per-deployment placements: refused inside the file.
@@ -199,6 +202,7 @@ const defaults: Raw = {
 		shutdown_timeout: "20s",
 	},
 	health: { listen: "127.0.0.1:9104" },
+	telemetry: { otlp_endpoint: "", sample_ratio: 1 },
 	identity: { mode: "disabled", owner: "anvilkit-agent-model-proxy", mtls: { principals: [] } },
 	control: {
 		timeout: "15s",
@@ -215,6 +219,8 @@ const defaults: Raw = {
 
 /** The keys the file may set (dotted; routes are validated separately). */
 const knownKeys = new Set([
+	"telemetry.otlp_endpoint",
+	"telemetry.sample_ratio",
 	"http.listen",
 	"http.max_body_bytes",
 	"http.request_header_timeout",
@@ -371,6 +377,11 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 	};
 	const listen = str(raw, "http.listen");
 	if (!listenPattern.test(listen)) errors.push(`http.listen ${JSON.stringify(listen)} is not host:port`);
+	const otlpEndpoint = str(raw, "telemetry.otlp_endpoint");
+	if (otlpEndpoint && !/^https?:\/\/[^\s/]+(\/[^\s]*)?$/.test(otlpEndpoint))
+		errors.push("telemetry.otlp_endpoint must be an http(s) URL of the collector");
+	const sampleRatio = Number(get(raw, "telemetry.sample_ratio"));
+	if (!(sampleRatio >= 0 && sampleRatio <= 1)) errors.push("telemetry.sample_ratio must be within [0, 1]");
 	const healthListen = str(raw, "health.listen");
 	if (!listenPattern.test(healthListen)) errors.push(`health.listen ${JSON.stringify(healthListen)} is not host:port`);
 	if (healthListen === listen && !listen.endsWith(":0")) {
@@ -615,6 +626,7 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 			shutdownTimeoutMs: attempt(() => duration(raw, "http.shutdown_timeout", 1000, 300_000), 1000),
 		},
 		health: { listen: healthListen },
+		telemetry: { otlpEndpoint, sampleRatio },
 		identity: { mode: identityMode, owner, principalsFile, mtls: { ...mtls, principals } },
 		control: {
 			address: controlAddress,
