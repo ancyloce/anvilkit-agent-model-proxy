@@ -49,6 +49,7 @@ modes of the environment, the s3 store backend and the mounted file paths. */}}
 {{- define "anvilkit-agent-model-proxy.config" -}}
 {{- $cfg := deepCopy .Values.config -}}
 {{- $_ := set $cfg.store "backend" "s3" -}}
+{{- $_ = set $cfg "development" (dict "enabled" .Values.development.enabled) -}}
 {{- $identity := dict "mode" .Values.identity.mode "owner" $cfg.identity.owner -}}
 {{- $mtls := dict "principals" $cfg.identity.mtls.principals -}}
 {{- if eq .Values.identity.mode "mtls" -}}
@@ -77,18 +78,54 @@ modes of the environment, the s3 store backend and the mounted file paths. */}}
 {{- if and (eq .Values.identity.mode "development") (not .Values.identity.principalsSecret.name) }}
 {{- fail "identity.principalsSecret.name is required under identity.mode development: an existing Secret holding the DEVELOPMENT_ONLY bearer principals file" }}
 {{- end }}
-{{- if and (eq .Values.identity.mode "mtls") (not .Values.identity.mtlsSecret.name) }}
-{{- fail "identity.mtlsSecret.name is required under identity.mode mtls: an existing Secret holding tls.crt, tls.key and ca.crt" }}
+{{- if and (eq .Values.identity.mode "mtls") (not .Values.identity.certificate.create) (not .Values.identity.mtlsSecret.name) }}
+{{- fail "identity.mtlsSecret.name is required under identity.mode mtls while identity.certificate.create is false: an existing Secret holding tls.crt, tls.key and ca.crt" }}
 {{- end }}
-{{- if and (eq .Values.control.identity.mode "mtls") (not .Values.control.identity.mtlsSecret.name) }}
-{{- fail "control.identity.mtlsSecret.name is required under control.identity.mode mtls" }}
+{{- if and (eq .Values.control.identity.mode "mtls") (not .Values.identity.certificate.create) (not .Values.control.identity.mtlsSecret.name) }}
+{{- fail "control.identity.mtlsSecret.name is required under control.identity.mode mtls while identity.certificate.create is false" }}
 {{- end }}
 {{- if not (has .Values.identity.mode (list "development" "mtls")) }}
 {{- fail "identity.mode must be development or mtls" }}
+{{- end }}
+{{- if not (has .Values.control.identity.mode (list "development" "mtls")) }}
+{{- fail "control.identity.mode must be development or mtls" }}
+{{- end }}
+{{- if and (eq .Values.identity.mode "development") (not .Values.development.enabled) }}
+{{- fail "identity.mode development is DEVELOPMENT_ONLY: it renders only with development.enabled: true (bearer principals authenticate no workload)" }}
+{{- end }}
+{{- if and (eq .Values.control.identity.mode "development") (not .Values.development.enabled) }}
+{{- fail "control.identity.mode development is DEVELOPMENT_ONLY: it renders only with development.enabled: true (a plaintext Control transport)" }}
+{{- end }}
+{{- if and .Values.identity.certificate.create (or (eq .Values.identity.mode "mtls") (eq .Values.control.identity.mode "mtls")) (not .Values.identity.certificate.issuerRef.name) }}
+{{- fail "identity.certificate.issuerRef.name is required: the cert-manager issuer of the workload certificate (or set identity.certificate.create false and the mtlsSecret names)" }}
+{{- end }}
+{{- if and (or (eq .Values.identity.mode "mtls") (eq .Values.control.identity.mode "mtls")) (not .Values.identity.trustDomain) (not .Values.development.enabled) }}
+{{- fail "identity.trustDomain is required outside development (the development default anvilkit.local applies only with development.enabled: true)" }}
+{{- end }}
+{{- if and (eq .Values.control.identity.mode "mtls") (not .Values.control.identity.mtlsSecret.serverName) }}
+{{- fail "control.identity.mtlsSecret.serverName is required under control.identity.mode mtls" }}
 {{- end }}
 {{- range .Values.routeCredentials }}
 {{- if or (not .env) (not .secret.name) (not .secret.key) }}
 {{- fail "every routeCredentials entry needs env, secret.name and secret.key" }}
 {{- end }}
 {{- end }}
+{{- end -}}
+
+
+{{/* The identity Secrets: the rendered Certificate's or the environment's. */}}
+{{- define "anvilkit-agent-model-proxy.identitySecret" -}}
+{{- if .Values.identity.certificate.create -}}
+{{- printf "%s-identity" (include "anvilkit-agent-model-proxy.fullname" .) -}}
+{{- else -}}
+{{- .Values.identity.mtlsSecret.name -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "anvilkit-agent-model-proxy.controlIdentitySecret" -}}
+{{- if .Values.identity.certificate.create -}}
+{{- printf "%s-identity" (include "anvilkit-agent-model-proxy.fullname" .) -}}
+{{- else -}}
+{{- .Values.control.identity.mtlsSecret.name -}}
+{{- end -}}
 {{- end -}}

@@ -164,12 +164,14 @@ spec:
         {{- else }}
         - name: mtls
           secret:
-            secretName: {{ .Values.identity.mtlsSecret.name }}
+            secretName: {{ include "anvilkit-agent-model-proxy.identitySecret" . }}
+            defaultMode: 0440
         {{- end }}
         {{- if eq .Values.control.identity.mode "mtls" }}
         - name: control-mtls
           secret:
-            secretName: {{ .Values.control.identity.mtlsSecret.name }}
+            secretName: {{ include "anvilkit-agent-model-proxy.controlIdentitySecret" . }}
+            defaultMode: 0440
         {{- end }}
       {{- with .Values.topologySpreadConstraints }}
       topologySpreadConstraints:

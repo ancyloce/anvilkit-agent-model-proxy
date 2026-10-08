@@ -52,11 +52,18 @@ health:
 # (keys tls.crt, tls.key, ca.crt) at /etc/anvilkit/control-mtls.
 control:
   address: ""
+  # identity.mode mtls (the default) presents the workload certificate and
+  # verifies Control by serverName (a DNS SAN of its certificate, standard
+  # hostname verification). The certificate is the workload Certificate this
+  # chart renders (identity.certificate.create) or an existing Secret
+  # (mtlsSecret.name, keys tls.crt, tls.key, ca.crt), mounted at
+  # /etc/anvilkit/control-mtls. development is the plaintext gRPC of the
+  # development foundation and renders only with development.enabled.
   identity:
-    mode: development
+    mode: mtls
     mtlsSecret:
       name: ""
-      serverName: ""
+      serverName: anvilkit-agent-control
 
 # The callers' identity. development mounts the DEVELOPMENT_ONLY bearer
 # principals file from principalsSecret (key principals.json); mtls serves
@@ -64,12 +71,32 @@ control:
 # and maps client certificate common names to caller kinds through
 # config.identity.mtls.principals.
 identity:
-  mode: development
+  mode: mtls
   principalsSecret:
     name: ""
     key: principals.json
   mtlsSecret:
     name: ""
+  # The workload Certificate (P0.1) issued by cert-manager from issuerRef:
+  # CN and DNS SANs name the Service (the callers' hostname verification),
+  # the URI SAN spiffe://<trustDomain>/ns/<namespace>/sa/<service-account>
+  # is the workload identity. It serves the mTLS listener and the Control
+  # client; with create false both mtlsSecret names must be set.
+  trustDomain: ""
+  certificate:
+    create: true
+    issuerRef:
+      name: ""
+      kind: ClusterIssuer
+      group: cert-manager.io
+    duration: 2160h
+    renewBefore: 720h
+
+# The top-level DEVELOPMENT_ONLY guard: identity.mode development (bearer
+# principals) and control.identity.mode development (plaintext) render only
+# while this is true; it downgrades nothing by itself.
+development:
+  enabled: false
 
 # The record and evidence store: in a cluster every replica must share one
 # backend, so the chart renders the S3 backend only (the filesystem adapter
