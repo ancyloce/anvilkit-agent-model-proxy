@@ -4,7 +4,6 @@
 // contract's explicit TypeScript validation (protovalidate over the
 // generated descriptors) before it is sent; Control's public refusal code
 // is carried in front of the status message, as the Go callers read it.
-import { readFileSync } from "node:fs";
 import {
 	AdmitModelRequest,
 	DispatchOutcome,
@@ -14,9 +13,17 @@ import {
 	ObserveDispatchRequest,
 } from "@anvilkit/generated-clients/proto/anvilkit/control/v1/dispatch";
 import { validateJson } from "@anvilkit/generated-clients/validation/rpc";
-import { type ChannelCredentials, credentials, Metadata, type ServiceError, status } from "@grpc/grpc-js";
+import {
+	type ChannelCredentials,
+	type ChannelOptions,
+	credentials,
+	Metadata,
+	type ServiceError,
+	status,
+} from "@grpc/grpc-js";
 import type { Config } from "../config.js";
 import type { ExecutionBinding, Outcome, Usage } from "../contracts.js";
+import { clientCredentials, clientOptions, IdentityWatcher } from "../identity.js";
 
 /** Control refused the request on a precondition; code is the public error code. */
 export class ControlRefused extends Error {
@@ -129,19 +136,40 @@ function refusal(err: ServiceError): Error {
 	}
 }
 
-function channelCredentials(cfg: Config["control"]["identity"]): ChannelCredentials {
+/**
+ * The Control transport under control.identity (P0.1): mtls presents the
+ * watched workload certificate and verifies Control through standard
+ * hostname verification against mtls.server_name (a DNS SAN of Control's
+ * certificate; never a CN comparison); development is the plaintext gRPC
+ * of the development foundation, which only the configuration loader
+ * admits under development.enabled.
+ */
+export interface ControlTransport {
+	creds: ChannelCredentials;
+	options: ChannelOptions;
+	close(): void;
+}
+
+export function controlTransport(
+	cfg: Config["control"]["identity"],
+	watcher?: IdentityWatcher,
+	log: { warn(msg: string, f?: Record<string, string>): void } = { warn: () => {} },
+): ControlTransport {
 	if (cfg.mode === "mtls") {
 		const m = cfg.mtls;
-		return credentials.createSsl(readFileSync(m.caFile), readFileSync(m.keyFile), readFileSync(m.certFile), {
-			checkServerIdentity: m.serverName
-				? (_host, cert) =>
-						cert.subject?.CN === m.serverName
-							? undefined
-							: new Error(`server name ${cert.subject?.CN} is not ${m.serverName}`)
-				: undefined,
-		});
+		const own =
+			watcher ?? new IdentityWatcher({ certFile: m.certFile, keyFile: m.keyFile, caFile: m.caFile }, 5000, log);
+		if (!watcher) own.start();
+		return {
+			creds: clientCredentials(own),
+			options: clientOptions(m.serverName),
+			close: () => {
+				if (!watcher) own.stop();
+			},
+		};
 	}
-	return credentials.createInsecure();
+	log.warn("DEVELOPMENT_ONLY Control transport: plaintext gRPC; qualifies no production identity");
+	return { creds: credentials.createInsecure(), options: {}, close: () => {} };
 }
 
 /** Validates a ts-proto message through the contract's protovalidate boundary before it is sent. */
@@ -155,13 +183,17 @@ function validated(typeName: string, json: unknown): void {
 
 export class ControlClient implements DispatchPort {
 	private readonly client: DispatchServiceClient;
+	private readonly transport: ControlTransport;
 
 	constructor(
 		address: string,
 		private readonly timeoutMs: number,
 		identity: Config["control"]["identity"],
+		watcher?: IdentityWatcher,
 	) {
-		this.client = new DispatchServiceClient(address, channelCredentials(identity), {
+		this.transport = controlTransport(identity, watcher);
+		this.client = new DispatchServiceClient(address, this.transport.creds, {
+			...this.transport.options,
 			// The Proxy never lets the channel retry a unary call by itself: an
 			// admission asked twice is the same durable command, and a lost
 			// answer is reentered by the caller under the same identity.
@@ -171,6 +203,7 @@ export class ControlClient implements DispatchPort {
 
 	close(): void {
 		this.client.close();
+		this.transport.close();
 	}
 
 	private call<Req, Res>(
