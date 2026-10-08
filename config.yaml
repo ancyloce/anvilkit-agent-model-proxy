@@ -1,7 +1,8 @@
 # anvilkit-agent-model-proxy configuration (reviewed, secret-free). Loaded by
 # src/config.ts with precedence defaults < this file < the allowlisted
 # environment overrides: ANVILKIT_MODEL_PROXY_LISTEN,
-# ANVILKIT_MODEL_PROXY_CONTROL_ADDRESS, ANVILKIT_MODEL_PROXY_PRINCIPALS_FILE
+# ANVILKIT_MODEL_PROXY_CONTROL_ADDRESS, ANVILKIT_MODEL_PROXY_IDENTITY_{CERT,KEY,CA}_FILE,
+# ANVILKIT_MODEL_PROXY_CONTROL_IDENTITY_{CERT,KEY,CA}_FILE, ANVILKIT_MODEL_PROXY_PRINCIPALS_FILE
 # (the DEVELOPMENT_ONLY bearer principals of identity.mode development),
 # ANVILKIT_MODEL_PROXY_STORE_DIR (filesystem backend),
 # ANVILKIT_MODEL_PROXY_STORE_S3_{ENDPOINT,BUCKET,ACCESS_KEY_ID,SECRET_ACCESS_KEY}
@@ -11,6 +12,15 @@
 # variable fail startup. Provider credentials, principals, store placements
 # and the contracts directory are refused inside this file. With
 # identity.mode disabled (the default) the process exits before listening.
+# development: the top-level DEVELOPMENT_ONLY guard (P0.1). This checked-in
+# file configures host-side runs on the development foundation, whose
+# scenarios select the bearer listener identity (identity.mode development)
+# in places; that mode and a plaintext Control transport are admitted only
+# while this is true, and the guard downgrades nothing by itself: the
+# Control client below stays mTLS. The chart renders its own file with the
+# guard off.
+development:
+  enabled: true
 http:
   listen: 127.0.0.1:9103
   max_body_bytes: 4194304
@@ -31,10 +41,16 @@ identity:
 control:
   address: 127.0.0.1:9101
   timeout: 15s
-  # identity.mode development is the plaintext gRPC of the development
-  # foundation and qualifies nothing; mtls names the client certificate files.
+  # identity.mode mtls presents the workload certificate (the files are
+  # placements: ANVILKIT_MODEL_PROXY_CONTROL_IDENTITY_{CERT,KEY,CA}_FILE,
+  # .local/dev/certs on the foundation) and verifies Control by server_name,
+  # a DNS SAN of its certificate; development is the plaintext gRPC of the
+  # development foundation (requires development.enabled) and qualifies
+  # nothing.
   identity:
-    mode: development
+    mode: mtls
+    mtls:
+      server_name: anvilkit-agent-control
   # A lost admission response is retried under the same call identity only
   # (Control answers the recorded decision, never a second permission).
   admission_retry:
