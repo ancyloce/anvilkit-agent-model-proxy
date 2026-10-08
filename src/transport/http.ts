@@ -25,6 +25,7 @@ import { CallError, type CallService, type Principal, statusOf } from "../applic
 import type { Config } from "../config.js";
 import type { Contract, ErrorCode, ErrorEnvelope, ModelCallRequest, StreamFrame } from "../contracts.js";
 import { ContractViolation } from "../contracts.js";
+import { IdentityWatcher } from "../identity.js";
 import type { Logger } from "../log.js";
 import { type RequestObserver, routeOf } from "../telemetry.js";
 
@@ -98,6 +99,8 @@ export class MtlsIdentity implements Identity {
 
 export interface HttpDeps {
 	cfg: Config;
+	/** The watched workload identity under identity.mode mtls (one per process; built here when absent). */
+	identityWatcher?: IdentityWatcher;
 	contract: Contract;
 	calls: CallService;
 	identity: Identity;
@@ -140,18 +143,33 @@ export function createServer(d: HttpDeps): Server {
 		void handle(d, req, res);
 	};
 	if (d.cfg.identity.mode === "mtls") {
+		// The watcher holds the validated material; every update it publishes
+		// becomes the listener's secure context for new connections (leaf and
+		// CA alike). The principal mapping stays the certificate common name
+		// (follow-up F-P0.1-1: the URI SAN form).
 		const m = d.cfg.identity.mtls;
-		return createHttpsServer(
+		const watcher =
+			d.identityWatcher ?? new IdentityWatcher({ certFile: m.certFile, keyFile: m.keyFile, caFile: m.caFile }, 5000);
+		const cur = watcher.current();
+		const server = createHttpsServer(
 			{
-				cert: readFileSync(m.certFile),
-				key: readFileSync(m.keyFile),
-				ca: readFileSync(m.caFile),
+				cert: cur.certPem,
+				key: cur.keyPem,
+				ca: cur.caPem,
 				requestCert: true,
 				rejectUnauthorized: true,
 				minVersion: "TLSv1.3",
 			},
 			handler,
 		);
+		watcher.onChange((_previous, current) =>
+			server.setSecureContext({ cert: current.certPem, key: current.keyPem, ca: current.caPem }),
+		);
+		if (!d.identityWatcher) {
+			watcher.start();
+			server.once("close", () => watcher.stop());
+		}
+		return server;
 	}
 	return createHttpServer(handler);
 }
