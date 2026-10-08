@@ -1,6 +1,34 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ControlClient, ControlRefused, ControlUnavailable } from "../src/adapters/control.js";
 import { FakeControl } from "./control.js";
+import { files, issue, mount, newCA, spiffe, tempDir } from "./pki.js";
+
+/** The Proxy's identity dir and Control's leaf under one throwaway CA (P0.1). */
+function lab() {
+	const ca = newCA("lab");
+	const dir = tempDir();
+	mount(
+		dir,
+		issue(ca, "anvilkit-agent-model-proxy", [spiffe("anvilkit.local", "anvilkit-apps", "anvilkit-agent-model-proxy")]),
+		ca.pem,
+	);
+	const control = issue(
+		ca,
+		"anvilkit-agent-control",
+		[spiffe("anvilkit.local", "anvilkit-apps", "anvilkit-agent-control")],
+		["anvilkit-agent-control"],
+	);
+	const f = files(dir);
+	return {
+		ca,
+		dir,
+		control,
+		identity: {
+			mode: "mtls" as const,
+			mtls: { certFile: f.certFile, keyFile: f.keyFile, caFile: f.caFile, serverName: "anvilkit-agent-control" },
+		},
+	};
+}
 
 const digest = "sha256:0dc7fa9db7237a2b5c96f70f59bb00f73bb86a0ca5554e91c312f9ada26e18b3";
 
@@ -8,11 +36,9 @@ describe("Control dispatch adapter", () => {
 	let control: FakeControl;
 	let client: ControlClient;
 	beforeAll(async () => {
-		control = await new FakeControl().start();
-		client = new ControlClient(control.address, 2_000, {
-			mode: "development",
-			mtls: { certFile: "", keyFile: "", caFile: "", serverName: "" },
-		});
+		const l = lab();
+		control = await new FakeControl().start({ ca: l.ca.pem, cert: l.control.certPem, key: l.control.keyPem });
+		client = new ControlClient(control.address, 2_000, l.identity);
 	});
 	afterAll(async () => {
 		client.close();
@@ -108,10 +134,7 @@ describe("Control dispatch adapter", () => {
 		control.unavailable = 1;
 		await expect(admit("call_e")).rejects.toBeInstanceOf(ControlUnavailable);
 		await expect(client.getDispatch("dsp_missing")).rejects.toMatchObject({ code: "NOT_FOUND" });
-		const unreachable = new ControlClient("127.0.0.1:1", 500, {
-			mode: "development",
-			mtls: { certFile: "", keyFile: "", caFile: "", serverName: "" },
-		});
+		const unreachable = new ControlClient("127.0.0.1:1", 500, lab().identity);
 		await expect(unreachable.getDispatch("dsp_x")).rejects.toBeInstanceOf(ControlUnavailable);
 		unreachable.close();
 	});

@@ -4,8 +4,10 @@
 // denial is recorded under the call, observations are deduplicated by
 // source and sequence. Faults are scripted: a lost admission answer (the
 // permission is consumed, the response never arrives) and unavailability.
-// It is a scenario double of the real Control; the parent's integration
-// scenarios use the real one.
+// It is a scenario double of the real Control (a TEST DOUBLE, never
+// imported by src/); the parent's integration scenarios use the real one.
+// It serves plaintext by default and mTLS (client certificates required
+// and verified against the given CA) when started with an identity.
 
 import {
 	type AdmitModelRequest,
@@ -56,7 +58,7 @@ export class FakeControl {
 	address = "";
 	private seq = 0;
 
-	async start(): Promise<this> {
+	async start(tls?: { ca: Buffer; cert: Buffer; key: Buffer }): Promise<this> {
 		this.server = new Server();
 		this.server.addService(DispatchServiceService, {
 			admitModel: (
@@ -77,8 +79,12 @@ export class FakeControl {
 				cb({ code: status.UNIMPLEMENTED, details: "not in the fake" } as never, null),
 		});
 		const port = await new Promise<number>((resolve, reject) =>
-			this.server.bindAsync("127.0.0.1:0", ServerCredentials.createInsecure(), (err, p) =>
-				err ? reject(err) : resolve(p),
+			this.server.bindAsync(
+				"127.0.0.1:0",
+				tls
+					? ServerCredentials.createSsl(tls.ca, [{ private_key: tls.key, cert_chain: tls.cert }], true)
+					: ServerCredentials.createInsecure(),
+				(err, p) => (err ? reject(err) : resolve(p)),
 			),
 		);
 		this.address = `127.0.0.1:${port}`;

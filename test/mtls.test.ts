@@ -96,7 +96,11 @@ describe.skipIf(!hasOpenssl)("mtls identity", () => {
 				"  mtls:\n    principals: []",
 				`  mtls:\n    cert_file: ${path.join(dir, "server.crt")}\n    key_file: ${path.join(dir, "server.key")}\n    ca_file: ${path.join(dir, "ca.crt")}\n    principals:\n      - common_name: anvilkit-agent-workflow\n        kind: workflow`,
 			)
-			.replace("listen: 127.0.0.1:9103", "listen: 127.0.0.1:0");
+			.replace("listen: 127.0.0.1:9103", "listen: 127.0.0.1:0")
+			.replace(
+				"  identity:\n    mode: mtls\n    mtls:\n      server_name: anvilkit-agent-control\n",
+				"  identity:\n    mode: development\n",
+			);
 		const cfg = configFrom(yaml, { ANVILKIT_MODEL_PROXY_STORE_DIR: scratch() });
 		const contract = new Contract();
 		const control = new ControlClient("127.0.0.1:1", 500, cfg.control.identity);

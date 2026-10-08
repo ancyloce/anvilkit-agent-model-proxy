@@ -10,6 +10,10 @@ const enabledRoute = base.replace("    enabled: false\n", "    enabled: true\n")
 const devEnv = {
 	ANVILKIT_MODEL_PROXY_PRINCIPALS_FILE: "/dev/null",
 	ANVILKIT_MODEL_PROXY_STORE_DIR: "/tmp/x",
+	// The Control identity files are placements the loader does not read.
+	ANVILKIT_MODEL_PROXY_CONTROL_IDENTITY_CERT_FILE: "/etc/anvilkit/identity/tls.crt",
+	ANVILKIT_MODEL_PROXY_CONTROL_IDENTITY_KEY_FILE: "/etc/anvilkit/identity/tls.key",
+	ANVILKIT_MODEL_PROXY_CONTROL_IDENTITY_CA_FILE: "/etc/anvilkit/identity/ca.crt",
 	ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1: "fixture-credential",
 };
 
@@ -28,10 +32,8 @@ describe("configuration", () => {
 	});
 
 	it("serves an enabled route only with its credential from the environment", () => {
-		const without = configFrom(enabledRoute.replace("mode: disabled", "mode: development"), {
-			ANVILKIT_MODEL_PROXY_PRINCIPALS_FILE: "/dev/null",
-			ANVILKIT_MODEL_PROXY_STORE_DIR: "/tmp/x",
-		});
+		const { ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1: _credential, ...withoutCredential } = devEnv;
+		const without = configFrom(enabledRoute.replace("mode: disabled", "mode: development"), withoutCredential);
 		const r = without.routes[0];
 		if (!r) throw new Error("route");
 		expect(routeDisabledReasons(without, r)).toEqual([

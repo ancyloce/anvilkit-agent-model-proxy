@@ -78,6 +78,11 @@ export function proxyConfig(o: ProxyOptions): Config {
 		.replace("listen: 127.0.0.1:9103", "listen: 127.0.0.1:0");
 	// The health listener binds an ephemeral port of its own.
 	yaml = `${yaml}\nhealth:\n  listen: 127.0.0.1:0\n`;
+	// The scenario Control double is plaintext: the development transport, admitted by the checked-in guard.
+	yaml = yaml.replace(
+		"  identity:\n    mode: mtls\n    mtls:\n      server_name: anvilkit-agent-control\n",
+		"  identity:\n    mode: development\n",
+	);
 	if (o.configEdits) yaml = o.configEdits(yaml);
 	return configFrom(yaml, {
 		ANVILKIT_MODEL_PROXY_CONTROL_ADDRESS: o.controlAddress,
