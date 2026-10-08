@@ -13,6 +13,7 @@ import { refuseGlobalFetch } from "./adapters/transport.js";
 import { CallService } from "./application/calls.js";
 import { type Config, disabled, load, routeDisabledReasons } from "./config.js";
 import { Contract } from "./contracts.js";
+import { IdentityWatcher } from "./identity.js";
 import { jsonLogger } from "./log.js";
 import { Telemetry } from "./telemetry.js";
 import {
@@ -35,7 +36,22 @@ export async function run(cfg: Config): Promise<void> {
 	const objects = newObjectStore(cfg);
 	if (cfg.store.backend !== "s3" || cfg.store.s3.qualifyOnStart) await objects.qualify();
 	const store = new CallStore(objects);
-	const control = new ControlClient(cfg.control.address, cfg.control.timeoutMs, cfg.control.identity);
+	// One watched workload identity per process (P0.1): the mTLS listener
+	// and the Control client share it when they name the same files.
+	const id = cfg.identity.mtls;
+	const identityWatcher =
+		cfg.identity.mode === "mtls"
+			? new IdentityWatcher({ certFile: id.certFile, keyFile: id.keyFile, caFile: id.caFile }, 5000, log)
+			: undefined;
+	identityWatcher?.start();
+	const c = cfg.control.identity.mtls;
+	const sameFiles = identityWatcher && c.certFile === id.certFile && c.keyFile === id.keyFile && c.caFile === id.caFile;
+	const control = new ControlClient(
+		cfg.control.address,
+		cfg.control.timeoutMs,
+		cfg.control.identity,
+		sameFiles ? identityWatcher : undefined,
+	);
 	const instanceId = `${hostname().slice(0, 24)}-${randomBytes(4).toString("hex")}`;
 	const calls = new CallService({ cfg, contract, control, store, log, instanceId });
 	const identity: Identity =
@@ -59,7 +75,7 @@ export async function run(cfg: Config): Promise<void> {
 	}
 	let ready = false;
 	const telemetry = new Telemetry(cfg.telemetry, "anvilkit-agent-model-proxy");
-	const server = createServer({ cfg, contract, calls, identity, log, observer: telemetry });
+	const server = createServer({ cfg, contract, calls, identity, identityWatcher, log, observer: telemetry });
 	server.requestTimeout = 0;
 	server.headersTimeout = cfg.http.requestHeaderTimeoutMs;
 	const health = createHealthServer(() => ready, telemetry.registry);
@@ -101,6 +117,7 @@ export async function run(cfg: Config): Promise<void> {
 	});
 	health.close();
 	control.close();
+	identityWatcher?.stop();
 	await telemetry.shutdown().catch((err) => log.warn("span flush failed", { error: String(err) }));
 }
 

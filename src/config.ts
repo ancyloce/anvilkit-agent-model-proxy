@@ -62,6 +62,8 @@ export interface MtlsFiles {
 }
 
 export interface Config {
+	/** The top-level DEVELOPMENT_ONLY guard: the bearer listener identity and the plaintext Control transport need their own development mode and this; it downgrades nothing by itself. File-only. */
+	development: { enabled: boolean };
 	http: {
 		listen: string;
 		maxBodyBytes: number;
@@ -141,6 +143,12 @@ const envOverrides: Record<string, string> = {
 	ANVILKIT_MODEL_PROXY_STORE_S3_SECRET_ACCESS_KEY: "store.s3.secret_access_key",
 	ANVILKIT_MODEL_PROXY_CONTRACTS_DIR: "contracts.dir",
 	ANVILKIT_MODEL_PROXY_TELEMETRY_OTLP_ENDPOINT: "telemetry.otlp_endpoint",
+	ANVILKIT_MODEL_PROXY_IDENTITY_CERT_FILE: "identity.mtls.cert_file",
+	ANVILKIT_MODEL_PROXY_IDENTITY_KEY_FILE: "identity.mtls.key_file",
+	ANVILKIT_MODEL_PROXY_IDENTITY_CA_FILE: "identity.mtls.ca_file",
+	ANVILKIT_MODEL_PROXY_CONTROL_IDENTITY_CERT_FILE: "control.identity.mtls.cert_file",
+	ANVILKIT_MODEL_PROXY_CONTROL_IDENTITY_KEY_FILE: "control.identity.mtls.key_file",
+	ANVILKIT_MODEL_PROXY_CONTROL_IDENTITY_CA_FILE: "control.identity.mtls.ca_file",
 };
 
 // Keys that are secrets or per-deployment placements: refused inside the file.
@@ -203,10 +211,11 @@ const defaults: Raw = {
 	},
 	health: { listen: "127.0.0.1:9104" },
 	telemetry: { otlp_endpoint: "", sample_ratio: 1 },
+	development: { enabled: false },
 	identity: { mode: "disabled", owner: "anvilkit-agent-model-proxy", mtls: { principals: [] } },
 	control: {
 		timeout: "15s",
-		identity: { mode: "development" },
+		identity: { mode: "development", mtls: { server_name: "anvilkit-agent-control" } },
 		admission_retry: { initial: "500ms", max_interval: "5s", max_attempts: 5 },
 	},
 	store: {
@@ -219,6 +228,7 @@ const defaults: Raw = {
 
 /** The keys the file may set (dotted; routes are validated separately). */
 const knownKeys = new Set([
+	"development.enabled",
 	"telemetry.otlp_endpoint",
 	"telemetry.sample_ratio",
 	"http.listen",
@@ -387,10 +397,15 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 	if (healthListen === listen && !listen.endsWith(":0")) {
 		errors.push("health.listen must be a listener of its own, not http.listen (the probes carry no identity)");
 	}
+	const development = attempt(() => bool(raw, "development.enabled"), false);
 	const identityMode = str(raw, "identity.mode") as IdentityMode;
 	if (!["disabled", "development", "mtls"].includes(identityMode)) {
 		errors.push(`identity.mode ${JSON.stringify(identityMode)} is not one of disabled, development, mtls`);
 	}
+	if (identityMode === "development" && !development)
+		errors.push(
+			"identity.mode development (plaintext bearer principals) requires development.enabled: true (DEVELOPMENT_ONLY)",
+		);
 	const owner = str(raw, "identity.owner");
 	if (!routeIdPattern.test(owner)) errors.push("identity.owner must be a contract Id");
 	const principalsFile = str(raw, "identity.principals_file");
@@ -446,9 +461,23 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 		caFile: str(raw, "control.identity.mtls.ca_file"),
 		serverName: str(raw, "control.identity.mtls.server_name"),
 	};
-	if (controlIdentity === "mtls" && (!controlMtls.certFile || !controlMtls.keyFile || !controlMtls.caFile)) {
-		errors.push("control.identity.mtls.cert_file, key_file and ca_file are required for control.identity.mode mtls");
+	// Like control.address and the store placements, the Control identity
+	// files are deployment inputs a disabled profile does not need.
+	if (
+		identityMode !== "disabled" &&
+		controlIdentity === "mtls" &&
+		(!controlMtls.certFile || !controlMtls.keyFile || !controlMtls.caFile)
+	) {
+		errors.push(
+			"control.identity.mtls.cert_file, key_file and ca_file are required for control.identity.mode mtls (ANVILKIT_MODEL_PROXY_CONTROL_IDENTITY_{CERT,KEY,CA}_FILE)",
+		);
 	}
+	if (controlIdentity === "mtls" && !controlMtls.serverName)
+		errors.push("control.identity.mtls.server_name is required for control.identity.mode mtls");
+	if (controlIdentity === "development" && identityMode !== "disabled" && !development)
+		errors.push(
+			"control.identity.mode development (plaintext gRPC) requires development.enabled: true (DEVELOPMENT_ONLY)",
+		);
 	const backend = str(raw, "store.backend");
 	if (!["filesystem", "s3"].includes(backend))
 		errors.push(`store.backend ${JSON.stringify(backend)} is not one of filesystem, s3`);
@@ -617,6 +646,7 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 		if (v) credentials.set(r.id, v);
 	}
 	const cfg: Config = {
+		development: { enabled: development },
 		http: {
 			listen,
 			maxBodyBytes: attempt(() => int(raw, "http.max_body_bytes", 1024, 1024 * 1024 * 1024), 1024),
