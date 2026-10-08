@@ -50,10 +50,10 @@ jobs:
         with:
           version: "v3.19.0"
       - run: >-
-          helm lint deploy/chart --set control.address=anvilkit-agent-control:9101
+          helm lint deploy/chart --set control.address=anvilkit-agent-control:9101 --set identity.trustDomain=ci.example --set identity.certificate.issuerRef.name=ci-issuer --set config.identity.mtls.principals[0].common_name=anvilkit-agent-workflow --set config.identity.mtls.principals[0].kind=workflow
           --set store.s3.endpoint=http://minio:9000 --set store.s3.bucket=anvilkit-model-proxy --set store.s3.secret.name=model-proxy-store
           --set identity.principalsSecret.name=model-proxy-principals
       - run: >-
-          helm template anvilkit-agent-model-proxy deploy/chart --set control.address=anvilkit-agent-control:9101
+          helm template anvilkit-agent-model-proxy deploy/chart --set control.address=anvilkit-agent-control:9101 --set identity.trustDomain=ci.example --set identity.certificate.issuerRef.name=ci-issuer --set config.identity.mtls.principals[0].common_name=anvilkit-agent-workflow --set config.identity.mtls.principals[0].kind=workflow
           --set store.s3.endpoint=http://minio:9000 --set store.s3.bucket=anvilkit-model-proxy --set store.s3.secret.name=model-proxy-store
           --set identity.principalsSecret.name=model-proxy-principals > /dev/null
