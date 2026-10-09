@@ -50,7 +50,7 @@ async function probe(address: string, dir: string, serverName = "anvilkit-agent-
 	const f = files(dir);
 	const c = new ControlClient(address, 2000, { mode: "mtls", mtls: { ...f, serverName } });
 	try {
-		await c.getDispatch("dsp_missing");
+		await c.getDispatch("tenant_a", "dsp_missing");
 		return "ok";
 	} catch (err) {
 		if (err instanceof ControlRefused) return err.code;
@@ -114,7 +114,7 @@ describe("Control transport identity", () => {
 				.replace("mode: disabled", "mode: mtls")
 				.replace(
 					"  mtls:\n    principals: []",
-					`  mtls:\n    cert_file: ${f.certFile}\n    key_file: ${f.keyFile}\n    ca_file: ${f.caFile}\n    principals:\n      - common_name: anvilkit-agent-workflow\n        kind: workflow`,
+					`  mtls:\n    cert_file: ${f.certFile}\n    key_file: ${f.keyFile}\n    ca_file: ${f.caFile}\n    principals:\n      - spiffe_id: spiffe://anvilkit.local/ns/anvilkit-apps/sa/anvilkit-agent-workflow\n        principal_id: anvilkit-agent-workflow\n        kind: workflow`,
 				),
 			{
 				ANVILKIT_MODEL_PROXY_STORE_DIR: "/tmp/x",

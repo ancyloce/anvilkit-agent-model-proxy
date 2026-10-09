@@ -74,7 +74,7 @@ describe("Control dispatch adapter", () => {
 		control.denials.set("denied-route", "PROFILE_UNQUALIFIED");
 		const denied = await admit("call_b", { routeId: "denied-route" });
 		expect(denied).toMatchObject({ allowed: false, state: "denied", denialCode: "PROFILE_UNQUALIFIED" });
-		expect(await client.getDispatch(first.dispatchId)).toMatchObject({
+		expect(await client.getDispatch("tenant_a", first.dispatchId)).toMatchObject({
 			callId: "call_a",
 			owner: "anvilkit-agent-model-proxy",
 			state: "authorized",
@@ -133,9 +133,9 @@ describe("Control dispatch adapter", () => {
 		expect(control.admits.length).toBe(before);
 		control.unavailable = 1;
 		await expect(admit("call_e")).rejects.toBeInstanceOf(ControlUnavailable);
-		await expect(client.getDispatch("dsp_missing")).rejects.toMatchObject({ code: "NOT_FOUND" });
+		await expect(client.getDispatch("tenant_a", "dsp_missing")).rejects.toMatchObject({ code: "NOT_FOUND" });
 		const unreachable = new ControlClient("127.0.0.1:1", 500, lab().identity);
-		await expect(unreachable.getDispatch("dsp_x")).rejects.toBeInstanceOf(ControlUnavailable);
+		await expect(unreachable.getDispatch("tenant_a", "dsp_x")).rejects.toBeInstanceOf(ControlUnavailable);
 		unreachable.close();
 	});
 });

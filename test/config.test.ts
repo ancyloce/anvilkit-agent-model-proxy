@@ -146,3 +146,123 @@ it("loads a CSI credential file and refuses ambiguous sources without disclosing
 		rmSync(dir, { recursive: true });
 	}
 });
+
+describe("P0.6 secret files, TLS and SPIFFE principals", () => {
+	const s3Config = base.replace("  backend: filesystem\n", "  backend: s3\n");
+	const outsideDevelopment = (yaml: string) =>
+		yaml.replace("development:\n  enabled: true\n", "development:\n  enabled: false\n");
+
+	it("reads the S3 key pair from mounted files, never both sources and never echoing them", () => {
+		const dir = mkdtempSync(join(tmpdir(), "proxy-s3-"));
+		try {
+			const id = join(dir, "access-key-id");
+			const secret = join(dir, "secret-access-key");
+			writeFileSync(id, "proxy-key-id\n");
+			writeFileSync(secret, "proxy-secret-value\n");
+			const env = {
+				...devEnv,
+				ANVILKIT_MODEL_PROXY_STORE_S3_ENDPOINT: "https://objects.anvilkit-data.svc:9000",
+				ANVILKIT_MODEL_PROXY_STORE_S3_BUCKET: "anvilkit-model-proxy",
+				ANVILKIT_MODEL_PROXY_STORE_S3_ACCESS_KEY_ID_FILE: id,
+				ANVILKIT_MODEL_PROXY_STORE_S3_SECRET_ACCESS_KEY_FILE: secret,
+			};
+			const cfg = configFrom(s3Config.replace("mode: disabled", "mode: development"), env);
+			expect(cfg.store.s3).toMatchObject({ accessKeyId: "proxy-key-id", secretAccessKey: "proxy-secret-value" });
+			const empty = join(dir, "empty");
+			writeFileSync(empty, "\n");
+			const cases: [Record<string, string>, RegExp][] = [
+				[
+					{ ...env, ANVILKIT_MODEL_PROXY_STORE_S3_ACCESS_KEY_ID: "inline" },
+					/store.s3.access_key_id: both direct and file sources supplied/,
+				],
+				[
+					{ ...env, ANVILKIT_MODEL_PROXY_STORE_S3_SECRET_ACCESS_KEY: "inline" },
+					/store.s3.secret_access_key: both direct and file sources supplied/,
+				],
+				[
+					{ ...env, ANVILKIT_MODEL_PROXY_STORE_S3_SECRET_ACCESS_KEY_FILE: join(dir, "missing") },
+					/store.s3.secret_access_key_file: cannot read the file/,
+				],
+				[
+					{ ...env, ANVILKIT_MODEL_PROXY_STORE_S3_ACCESS_KEY_ID_FILE: empty },
+					/store.s3.access_key_id_file: the file is empty/,
+				],
+			];
+			for (const [e, want] of cases) {
+				let message = "";
+				try {
+					configFrom(s3Config, e);
+				} catch (err) {
+					message = (err as Error).message;
+				}
+				expect(message).toMatch(want);
+				expect(message).not.toContain("proxy-secret-value");
+			}
+			// The file keys are placements: refused inside the reviewed file.
+			expect(() =>
+				configFrom(
+					base.replace("  s3:\n    region: default", `  s3:\n    access_key_id_file: ${id}\n    region: default`),
+				),
+			).toThrow(/comes only from the environment/);
+		} finally {
+			rmSync(dir, { recursive: true });
+		}
+	});
+
+	it("requires an https:// store endpoint outside development; the guard admits the foundation's plaintext MinIO", () => {
+		const env = { ANVILKIT_MODEL_PROXY_STORE_S3_ENDPOINT: "http://minio:9000" };
+		expect(() => configFrom(outsideDevelopment(s3Config), env)).toThrow(
+			/store.s3.endpoint must be https:\/\/ outside development/,
+		);
+		expect(configFrom(s3Config, env).store.s3.endpoint).toBe("http://minio:9000");
+		expect(
+			configFrom(outsideDevelopment(s3Config), { ANVILKIT_MODEL_PROXY_STORE_S3_ENDPOINT: "https://minio:9000" }).store
+				.s3.endpoint,
+		).toBe("https://minio:9000");
+	});
+
+	it("maps mTLS callers by SPIFFE ID and refuses common names, malformed entries and duplicates (F-P0.1-1)", () => {
+		const env = {
+			...devEnv,
+			ANVILKIT_MODEL_PROXY_IDENTITY_CERT_FILE: "/etc/anvilkit/identity/tls.crt",
+			ANVILKIT_MODEL_PROXY_IDENTITY_KEY_FILE: "/etc/anvilkit/identity/tls.key",
+			ANVILKIT_MODEL_PROXY_IDENTITY_CA_FILE: "/etc/anvilkit/identity/ca.crt",
+		};
+		const withPrincipals = (list: string) =>
+			base
+				.replace("mode: disabled", "mode: mtls")
+				.replace("  mtls:\n    principals: []", `  mtls:\n    principals:\n${list}`);
+		const workflow =
+			"      - spiffe_id: spiffe://anvilkit.local/ns/anvilkit-apps/sa/anvilkit-agent-workflow\n        principal_id: anvilkit-agent-workflow\n        kind: workflow\n";
+		expect(configFrom(withPrincipals(workflow), env).identity.mtls.principals).toEqual([
+			{
+				spiffeId: "spiffe://anvilkit.local/ns/anvilkit-apps/sa/anvilkit-agent-workflow",
+				principalId: "anvilkit-agent-workflow",
+				kind: "workflow",
+			},
+		]);
+		const cases: [string, RegExp][] = [
+			["      - common_name: anvilkit-agent-workflow\n        kind: workflow\n", /unknown key common_name/],
+			[`${workflow}${workflow}`, /principals\[1\].spiffe_id .* is declared twice/],
+			[
+				"      - spiffe_id: https://anvilkit.local/workflow\n        principal_id: w\n        kind: workflow\n",
+				/principals\[0\].spiffe_id must be a SPIFFE ID/,
+			],
+			[
+				"      - spiffe_id: spiffe://anvilkit.local\n        principal_id: w\n        kind: workflow\n",
+				/principals\[0\].spiffe_id must be a SPIFFE ID/,
+			],
+			[
+				"      - spiffe_id: spiffe://anvilkit.local/ns/a/sa/w\n        kind: workflow\n",
+				/principals\[0\].principal_id must be a contract Id/,
+			],
+			[
+				"      - spiffe_id: spiffe://anvilkit.local/ns/a/sa/w\n        principal_id: w\n        kind: admin\n",
+				/principals\[0\].kind must be workflow, sidecar or control/,
+			],
+			[`${workflow}        extra: 1\n`, /principals\[0\]: unknown key extra/],
+			["      - anvilkit-agent-workflow\n", /principals\[0\] must be a mapping/],
+		];
+		for (const [list, want] of cases) expect(() => configFrom(withPrincipals(list), env), list).toThrow(want);
+	});
+});

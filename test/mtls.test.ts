@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
-import { request as httpRequest } from "node:http";
+import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
@@ -10,14 +10,39 @@ import { CallStore, FilesystemStore } from "../src/adapters/store.js";
 import { CallService } from "../src/application/calls.js";
 import { Contract } from "../src/contracts.js";
 import { silentLogger } from "../src/log.js";
-import { createHealthServer, createServer, MtlsIdentity } from "../src/transport/http.js";
+import {
+	createHealthServer,
+	createServer,
+	MtlsIdentity,
+	parseSubjectAltName,
+	spiffeIdOf,
+} from "../src/transport/http.js";
 import { checkedInConfig, configFrom, scratch } from "./helpers.js";
 
 function openssl(args: string[], cwd: string): void {
 	execFileSync("openssl", args, { cwd, stdio: "ignore" });
 }
 
-/** A private CA with a server certificate and two client certificates (one known principal, one stranger). */
+const workflowId = "spiffe://anvilkit.local/ns/anvilkit-apps/sa/anvilkit-agent-workflow";
+
+/**
+ * The client certificates by name: [common name, subjectAltName]. Only the
+ * SPIFFE ID (the single URI SAN) authenticates (F-P0.1-1); the common name is
+ * never consulted.
+ */
+const clients: Record<string, [string, string]> = {
+	workflow: ["anvilkit-agent-workflow", `URI:${workflowId}`],
+	renamed: ["not-the-workflow", `URI:${workflowId},DNS:anything.example`],
+	stranger: ["someone-else", "URI:spiffe://anvilkit.local/ns/anvilkit-apps/sa/someone-else"],
+	"cn-only": ["anvilkit-agent-workflow", "DNS:anvilkit-agent-workflow"],
+	"other-uri": ["anvilkit-agent-workflow", "URI:https://anvilkit.local/ns/anvilkit-apps/sa/anvilkit-agent-workflow"],
+	"two-spiffe": [
+		"anvilkit-agent-workflow",
+		`URI:${workflowId},URI:spiffe://anvilkit.local/ns/anvilkit-apps/sa/anvilkit-agent-control`,
+	],
+};
+
+/** A private CA with a server certificate and the client certificates above. */
 function pki(dir: string): void {
 	openssl(
 		[
@@ -37,16 +62,13 @@ function pki(dir: string): void {
 		],
 		dir,
 	);
-	for (const [name, cn] of [
-		["server", "localhost"],
-		["workflow", "anvilkit-agent-workflow"],
-		["stranger", "someone-else"],
-	]) {
+	for (const [name, cn, san] of [
+		["server", "localhost", "IP:127.0.0.1,DNS:localhost"],
+		...Object.entries(clients).map(([name, [cn, san]]) => [name, cn, san]),
+	] as [string, string, string][]) {
 		writeFileSync(
 			path.join(dir, `${name}.ext`),
-			name === "server"
-				? "subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth\n"
-				: "extendedKeyUsage=clientAuth\n",
+			`subjectAltName=${san}\nextendedKeyUsage=${name === "server" ? "serverAuth" : "clientAuth"}\n`,
 		);
 		openssl(
 			["req", "-newkey", "rsa:2048", "-nodes", "-keyout", `${name}.key`, "-out", `${name}.csr`, "-subj", `/CN=${cn}`],
@@ -94,7 +116,7 @@ describe.skipIf(!hasOpenssl)("mtls identity", () => {
 			.replace("mode: disabled", "mode: mtls")
 			.replace(
 				"  mtls:\n    principals: []",
-				`  mtls:\n    cert_file: ${path.join(dir, "server.crt")}\n    key_file: ${path.join(dir, "server.key")}\n    ca_file: ${path.join(dir, "ca.crt")}\n    principals:\n      - common_name: anvilkit-agent-workflow\n        kind: workflow`,
+				`  mtls:\n    cert_file: ${path.join(dir, "server.crt")}\n    key_file: ${path.join(dir, "server.key")}\n    ca_file: ${path.join(dir, "ca.crt")}\n    principals:\n      - spiffe_id: ${workflowId}\n        principal_id: anvilkit-agent-workflow\n        kind: workflow`,
 			)
 			.replace("listen: 127.0.0.1:9103", "listen: 127.0.0.1:0")
 			.replace(
@@ -176,6 +198,11 @@ describe.skipIf(!hasOpenssl)("mtls identity", () => {
 		await expect(get()).rejects.toThrow();
 	});
 
+	it("authenticates by the SPIFFE ID only: the right common name without it, another URI or two SPIFFE IDs are refused (F-P0.1-1)", async () => {
+		expect((await get("renamed")).status).toBe(404);
+		for (const name of ["cn-only", "other-uri", "two-spiffe"]) expect((await get(name)).status, name).toBe(401);
+	});
+
 	it("the probes answer on the plaintext health listener without a certificate; the business listener stays mTLS", async () => {
 		const probe = (pathname: string) =>
 			new Promise<{ status: number; body: string }>((resolve, reject) => {
@@ -194,5 +221,62 @@ describe.skipIf(!hasOpenssl)("mtls identity", () => {
 		expect(await probe("/readyz")).toEqual({ status: 200, body: "ready" });
 		expect((await probe("/api/v1/model-calls/call_x")).status).toBe(404);
 		await expect(get()).rejects.toThrow();
+	});
+});
+
+describe("SPIFFE principal mapping (F-P0.1-1)", () => {
+	const socketWith = (subjectaltname: string | undefined, authorized = true, cn = "anvilkit-agent-workflow") =>
+		({
+			socket: { authorized, getPeerCertificate: () => ({ subject: { CN: cn }, subjectaltname }) },
+		}) as unknown as IncomingMessage;
+	const sidecarId = "spiffe://anvilkit.local/ns/anvilkit-jobs/sa/anvilkit-job-access-sidecar";
+	const identity = new MtlsIdentity([
+		{ spiffeId: workflowId, principalId: "workflow-principal", kind: "workflow" },
+		{ spiffeId: sidecarId, principalId: "sidecar-a", kind: "sidecar" },
+	]);
+
+	it("returns the configured principal id and kind of the certificate's SPIFFE ID", () => {
+		expect(
+			identity.authenticate(socketWith(`DNS:localhost, URI:${workflowId}, IP Address:127.0.0.1`, true, "x")),
+		).toEqual({
+			id: "workflow-principal",
+			kind: "workflow",
+		});
+		expect(identity.authenticate(socketWith(`URI:${sidecarId}`))).toEqual({ id: "sidecar-a", kind: "sidecar" });
+	});
+
+	it("refuses an unauthorized peer, no or another URI, several URIs and an unknown or malformed list", () => {
+		for (const san of [
+			undefined,
+			"",
+			"DNS:anvilkit-agent-workflow",
+			"URI:https://anvilkit.local/workflow",
+			`URI:${workflowId}, URI:${workflowId}`,
+			`URI:${workflowId}, URI:${sidecarId}`,
+			`URI:${workflowId}, URI:https://anvilkit.local/x`,
+			"URI:spiffe://anvilkit.local/ns/anvilkit-apps/sa/unknown",
+			`URI:${workflowId}, `,
+			`URI:"${workflowId}`,
+		])
+			expect(identity.authenticate(socketWith(san)), String(san)).toBeUndefined();
+		expect(identity.authenticate(socketWith(`URI:${workflowId}`, false))).toBeUndefined();
+	});
+
+	it("parses quoted values with commas and escapes as Node prints them", () => {
+		expect(
+			parseSubjectAltName('DNS:a.example, URI:"spiffe://anvilkit.local/x, URI:spiffe://evil/y", IP Address:10.0.0.1'),
+		).toEqual([
+			{ type: "DNS", value: "a.example" },
+			{ type: "URI", value: "spiffe://anvilkit.local/x, URI:spiffe://evil/y" },
+			{ type: "IP Address", value: "10.0.0.1" },
+		]);
+		expect(parseSubjectAltName(String.raw`URI:"a\"b\\c"`)).toEqual([{ type: "URI", value: String.raw`a"b\c` }]);
+		// A comma inside a quoted value never yields a second SPIFFE ID.
+		expect(spiffeIdOf('URI:"spiffe://anvilkit.local/x, URI:spiffe://evil/y"')).toBe(
+			"spiffe://anvilkit.local/x, URI:spiffe://evil/y",
+		);
+		expect(spiffeIdOf(`DNS:x, URI:${workflowId}`)).toBe(workflowId);
+		expect(parseSubjectAltName("no-colon")).toBeUndefined();
+		expect(parseSubjectAltName("DNS:a,DNS:b")).toEqual([{ type: "DNS", value: "a,DNS:b" }]);
 	});
 });
