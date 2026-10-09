@@ -68,8 +68,9 @@ control:
 # The callers' identity. development mounts the DEVELOPMENT_ONLY bearer
 # principals file from principalsSecret (key principals.json); mtls serves
 # TLS with the server certificate of mtlsSecret (tls.crt, tls.key, ca.crt)
-# and maps client certificate common names to caller kinds through
-# config.identity.mtls.principals.
+# and maps the client certificate's one SPIFFE URI SAN to a principal
+# through config.identity.mtls.principals ({spiffe_id, principal_id, kind};
+# the common name is never consulted).
 identity:
   mode: mtls
   principalsSecret:
@@ -112,6 +113,31 @@ store:
       name: ""
       accessKeyIdKey: accessKeyId
       secretAccessKeyKey: secretAccessKey
+
+# Credential delivery (P0.6). kubernetes reads store.s3.secret and the
+# routeCredentials Secrets (and the external credentialCSI class, if named):
+# the development foundation's path. csi renders this chart's own
+# SecretProviderClass (provider openbao, Kubernetes auth with the Pod's
+# ServiceAccount token of audience csi.audience; no Kubernetes Secret is
+# synced) mounted read-only at /var/run/secrets/anvilkit/csi: the service's
+# KV v2 path holds store-access-key-id and store-secret-access-key, and one
+# key per providerCredentials entry, read through <env>_FILE.
+secrets:
+  provider: kubernetes
+  csi:
+    address: ""
+    caCertPath: ""
+    audience: openbao
+    role: ""
+    path: ""
+    providerCredentials: [] # [{env: ANVILKIT_MODEL_PROXY_CREDENTIAL_DEEPSEEK, key: deepseek-api-key}]
+
+# P0.6: the data plane's CA bundle: a ConfigMap (key ca.crt) in this
+# namespace, e.g. the anvilkit-trust map deploy/qualification/bootstrap.py
+# maintains, mounted at /etc/anvilkit/trust and added to the process roots
+# (NODE_EXTRA_CA_CERTS) for the data stores' TLS. Empty: the image's roots only.
+trust:
+  configMap: ""
 
 # Route credentials: one entry per served route, naming the environment
 # variable the route declares (credential_env) and the existing Secret and

@@ -49,6 +49,10 @@ spec:
           # path, the placement values, the secrets from their Secrets and
           # the credential of every served route.
           env:
+            {{- if .Values.trust.configMap }}
+            - name: NODE_EXTRA_CA_CERTS
+              value: /etc/anvilkit/trust/ca.crt
+            {{- end }}
             - name: ANVILKIT_MODEL_PROXY_CONFIG
               value: /etc/anvilkit/anvilkit-agent-model-proxy/config.yaml
             - name: ANVILKIT_MODEL_PROXY_CONTRACTS_DIR
@@ -71,6 +75,16 @@ spec:
               value: {{ .Values.store.s3.endpoint | quote }}
             - name: ANVILKIT_MODEL_PROXY_STORE_S3_BUCKET
               value: {{ .Values.store.s3.bucket | quote }}
+            {{- if eq .Values.secrets.provider "csi" }}
+            - name: ANVILKIT_MODEL_PROXY_STORE_S3_ACCESS_KEY_ID_FILE
+              value: /var/run/secrets/anvilkit/csi/store-access-key-id
+            - name: ANVILKIT_MODEL_PROXY_STORE_S3_SECRET_ACCESS_KEY_FILE
+              value: /var/run/secrets/anvilkit/csi/store-secret-access-key
+            {{- range .Values.secrets.csi.providerCredentials }}
+            - name: {{ printf "%s_FILE" .env }}
+              value: {{ printf "/var/run/secrets/anvilkit/csi/%s" .key | quote }}
+            {{- end }}
+            {{- else }}
             - name: ANVILKIT_MODEL_PROXY_STORE_S3_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -81,6 +95,7 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.store.s3.secret.name }}
                   key: {{ .Values.store.s3.secret.secretAccessKeyKey }}
+            {{- end }}
             {{- range .Values.routeCredentials }}
             - name: {{ .env }}
               valueFrom:
@@ -123,6 +138,11 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
+            {{- if eq .Values.secrets.provider "csi" }}
+            - name: credentials
+              mountPath: /var/run/secrets/anvilkit/csi
+              readOnly: true
+            {{- end }}
             {{- if .Values.credentialCSI.secretProviderClass }}
             - name: provider
               mountPath: /var/run/secrets/anvilkit/provider
@@ -131,6 +151,11 @@ spec:
             - name: config
               mountPath: /etc/anvilkit/anvilkit-agent-model-proxy
               readOnly: true
+            {{- if .Values.trust.configMap }}
+            - name: trust
+              mountPath: /etc/anvilkit/trust
+              readOnly: true
+            {{- end }}
             {{- if eq .Values.identity.mode "development" }}
             - name: principals
               mountPath: /etc/anvilkit/model-proxy-principals
@@ -146,6 +171,14 @@ spec:
               readOnly: true
             {{- end }}
       volumes:
+        {{- if eq .Values.secrets.provider "csi" }}
+        - name: credentials
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: {{ include "anvilkit-agent-model-proxy.fullname" . }}
+        {{- end }}
         {{- if .Values.credentialCSI.secretProviderClass }}
         - name: provider
           csi:
@@ -157,6 +190,12 @@ spec:
         - name: config
           configMap:
             name: {{ include "anvilkit-agent-model-proxy.fullname" . }}
+        {{- if .Values.trust.configMap }}
+        - name: trust
+          configMap:
+            name: {{ .Values.trust.configMap }}
+            items: [{key: ca.crt, path: ca.crt}]
+        {{- end }}
         {{- if eq .Values.identity.mode "development" }}
         - name: principals
           secret:

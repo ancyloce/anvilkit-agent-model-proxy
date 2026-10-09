@@ -69,10 +69,17 @@ modes of the environment, the s3 store backend and the mounted file paths. */}}
 
 {{/* Required environment values, checked once for every template. */}}
 {{- define "anvilkit-agent-model-proxy.require" -}}
+{{- $kube := eq .Values.secrets.provider "kubernetes" -}}
+{{- if not (has .Values.secrets.provider (list "kubernetes" "csi")) }}
+{{- fail "secrets.provider must be kubernetes or csi" }}
+{{- end }}
+{{- if and (not $kube) (or (not .Values.secrets.csi.address) (not .Values.secrets.csi.path)) }}
+{{- fail "secrets.csi.address and secrets.csi.path are required under secrets.provider csi (the OpenBao address and the service's KV v2 data path)" }}
+{{- end }}
 {{- if not .Values.control.address }}
 {{- fail "control.address is required: Control's DispatchService (ANVILKIT_MODEL_PROXY_CONTROL_ADDRESS)" }}
 {{- end }}
-{{- if or (not .Values.store.s3.endpoint) (not .Values.store.s3.bucket) (not .Values.store.s3.secret.name) }}
+{{- if or (not .Values.store.s3.endpoint) (not .Values.store.s3.bucket) (and $kube (not .Values.store.s3.secret.name)) }}
 {{- fail "store.s3.endpoint, store.s3.bucket and store.s3.secret.name are required: the shared record and evidence store every replica uses (ANVILKIT_MODEL_PROXY_STORE_S3_*)" }}
 {{- end }}
 {{- if and (eq .Values.identity.mode "development") (not .Values.identity.principalsSecret.name) }}
