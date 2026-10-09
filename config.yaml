@@ -6,7 +6,10 @@
 # (the DEVELOPMENT_ONLY bearer principals of identity.mode development),
 # ANVILKIT_MODEL_PROXY_STORE_DIR (filesystem backend),
 # ANVILKIT_MODEL_PROXY_STORE_S3_{ENDPOINT,BUCKET,ACCESS_KEY_ID,SECRET_ACCESS_KEY}
-# (s3 backend; the key pair is a secret), ANVILKIT_MODEL_PROXY_CONTRACTS_DIR
+# (s3 backend; the key pair is a secret, also accepted as the mounted secret
+# files ANVILKIT_MODEL_PROXY_STORE_S3_{ACCESS_KEY_ID,SECRET_ACCESS_KEY}_FILE,
+# never both sources; outside development the endpoint must be https://),
+# ANVILKIT_MODEL_PROXY_CONTRACTS_DIR
 # and the route credentials ANVILKIT_MODEL_PROXY_CREDENTIAL_<NAME> that the
 # routes below declare. Unknown keys and any other ANVILKIT_MODEL_PROXY_*
 # variable fail startup. Provider credentials, principals, store placements
@@ -30,8 +33,16 @@ http:
   shutdown_timeout: 20s
 identity:
   # disabled | development (bearer principals file, DEVELOPMENT_ONLY) | mtls
-  # (client certificates of the workload identity, ENV-03; principals map a
-  # certificate common name to the caller kind).
+  # (client certificates of the workload identity, ENV-03). Under mtls a
+  # caller is authenticated by the SPIFFE ID of its verified certificate —
+  # the certificate's single URI SAN; none, several or a non-SPIFFE URI is
+  # refused and the common name is not consulted (F-P0.1-1) — and
+  # principals map that SPIFFE ID to the principal id recorded downstream
+  # and the caller kind (workflow, sidecar or control), each SPIFFE ID once:
+  #   principals:
+  #     - spiffe_id: spiffe://anvilkit.local/ns/anvilkit-apps/sa/anvilkit-agent-workflow
+  #       principal_id: anvilkit-agent-workflow
+  #       kind: workflow
   mode: disabled
   # owner is the sender identity recorded on Control's dispatch records
   # (AdmitModel owner); the authenticated caller is the command actor.
