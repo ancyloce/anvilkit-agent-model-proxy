@@ -1608,6 +1608,9 @@ describe("two Proxy instances on one store", () => {
 			expect(rec?.frames).toEqual([]);
 			expect(rec?.observations).toEqual([expect.objectContaining({ source: "model-proxy/d", submitted: true })]);
 			expect(existsSync(markerOf(callId))).toBe(true);
+			// The record turns sending before its one send reaches the upstream
+			// (marker first): wait for that receive, then exactly one.
+			for (let i = 0; i < 100 && up.receives.length < sends + 1; i++) await new Promise((r) => setTimeout(r, 50));
 			expect(up.receives.length).toBe(sends + 1);
 			// The other instance's sweep before the deadline keeps the active send discoverable.
 			expect(await b.calls.sweep()).toMatchObject({ completed: 0, reclaimed: 0, resubmitted: 0 });
