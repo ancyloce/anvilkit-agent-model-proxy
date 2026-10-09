@@ -83,7 +83,7 @@ export interface DispatchView {
 export interface DispatchPort {
 	admitModel(input: AdmitInput): Promise<AdmissionResult>;
 	observe(input: ObserveInput): Promise<{ existing: boolean; state: AdmissionResult["state"] }>;
-	getDispatch(dispatchId: string): Promise<DispatchView>;
+	getDispatch(tenantId: string, dispatchId: string): Promise<DispatchView>;
 	close(): void;
 }
 
@@ -279,8 +279,9 @@ export class ControlClient implements DispatchPort {
 		return { existing: res.existing, state: stateOf(res.dispatch.state) };
 	}
 
-	async getDispatch(dispatchId: string): Promise<DispatchView> {
-		const req = GetDispatchRequest.fromPartial({ dispatchId });
+	/** Reads one of this proxy's own dispatches of the tenant (P0.2: Control binds the read to the caller's owner identity and the tenant). */
+	async getDispatch(tenantId: string, dispatchId: string): Promise<DispatchView> {
+		const req = GetDispatchRequest.fromPartial({ dispatchId, tenantId });
 		validated("anvilkit.control.v1.GetDispatchRequest", GetDispatchRequest.toJSON(req));
 		const res = await this.call(this.client.getDispatch, req);
 		const d = res.dispatch;

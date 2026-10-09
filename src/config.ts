@@ -54,6 +54,18 @@ export interface Route {
 	tools: ToolSchema[];
 }
 
+/**
+ * A caller of the mTLS listener (F-P0.1-1): the SPIFFE ID of its client
+ * certificate (the certificate's single URI SAN) selects the principal id the
+ * Proxy records downstream and the caller kind; the common name is not
+ * consulted.
+ */
+export interface MtlsPrincipal {
+	spiffeId: string;
+	principalId: string;
+	kind: PrincipalKind;
+}
+
 export interface MtlsFiles {
 	certFile: string;
 	keyFile: string;
@@ -80,7 +92,7 @@ export interface Config {
 		mode: IdentityMode;
 		owner: string;
 		principalsFile: string;
-		mtls: MtlsFiles & { principals: { commonName: string; kind: PrincipalKind }[] };
+		mtls: MtlsFiles & { principals: MtlsPrincipal[] };
 	};
 	control: {
 		address: string;
@@ -141,6 +153,8 @@ const envOverrides: Record<string, string> = {
 	ANVILKIT_MODEL_PROXY_STORE_S3_BUCKET: "store.s3.bucket",
 	ANVILKIT_MODEL_PROXY_STORE_S3_ACCESS_KEY_ID: "store.s3.access_key_id",
 	ANVILKIT_MODEL_PROXY_STORE_S3_SECRET_ACCESS_KEY: "store.s3.secret_access_key",
+	ANVILKIT_MODEL_PROXY_STORE_S3_ACCESS_KEY_ID_FILE: "store.s3.access_key_id_file",
+	ANVILKIT_MODEL_PROXY_STORE_S3_SECRET_ACCESS_KEY_FILE: "store.s3.secret_access_key_file",
 	ANVILKIT_MODEL_PROXY_CONTRACTS_DIR: "contracts.dir",
 	ANVILKIT_MODEL_PROXY_TELEMETRY_OTLP_ENDPOINT: "telemetry.otlp_endpoint",
 	ANVILKIT_MODEL_PROXY_IDENTITY_CERT_FILE: "identity.mtls.cert_file",
@@ -159,6 +173,8 @@ const environmentOnly = [
 	"store.s3.bucket",
 	"store.s3.access_key_id",
 	"store.s3.secret_access_key",
+	"store.s3.access_key_id_file",
+	"store.s3.secret_access_key_file",
 	"contracts.dir",
 ];
 
@@ -168,6 +184,7 @@ const toolNamePattern = /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/;
 const moneyPattern = /^(0|[1-9][0-9]{0,29})$/;
 const currencyPattern = /^[A-Z]{3}$/;
 const listenPattern = /^[^:\s]+:\d{1,5}$/;
+const spiffeIdPattern = /^spiffe:\/\/[^/]+\/.+/;
 
 type Raw = Record<string, unknown>;
 
@@ -372,6 +389,29 @@ function duration(raw: Raw, key: string, loMs: number, hiMs: number): number {
 	return ms;
 }
 
+/**
+ * A secret from the environment or from its mounted file (<key>_file, the
+ * CSI-delivered form of P0.6), never both; the content is never echoed.
+ */
+function secretFrom(raw: Raw, key: string, errors: string[]): string {
+	const value = str(raw, key);
+	const file = str(raw, `${key}_file`);
+	if (!file) return value;
+	if (value) {
+		errors.push(`${key}: both direct and file sources supplied`);
+		return value;
+	}
+	let content = "";
+	try {
+		content = readFileSync(file, "utf8").trim();
+	} catch {
+		errors.push(`${key}_file: cannot read the file`);
+		return "";
+	}
+	if (!content) errors.push(`${key}_file: the file is empty`);
+	return content;
+}
+
 function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map<string, string>): Config {
 	const errors: string[] = [];
 	const attempt = <T>(fn: () => T, fallback: T): T => {
@@ -420,25 +460,34 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 		caFile: str(raw, "identity.mtls.ca_file"),
 		serverName: str(raw, "identity.mtls.server_name"),
 	};
+	// F-P0.1-1: a caller is named by the SPIFFE ID of its certificate, never
+	// by the common name.
 	const principalsRaw = get(raw, "identity.mtls.principals");
-	const principals: { commonName: string; kind: PrincipalKind }[] = [];
+	const principals: MtlsPrincipal[] = [];
 	if (!Array.isArray(principalsRaw)) {
 		errors.push("identity.mtls.principals must be a list");
 	} else {
+		const ids = new Set<string>();
 		principalsRaw.forEach((p, i) => {
-			if (
-				!isObject(p) ||
-				typeof p.common_name !== "string" ||
-				!p.common_name ||
-				!["workflow", "sidecar", "control"].includes(String(p.kind))
-			) {
-				errors.push(`identity.mtls.principals[${i}] needs common_name and kind (workflow, sidecar or control)`);
+			const prefix = `identity.mtls.principals[${i}]`;
+			if (!isObject(p)) {
+				errors.push(`${prefix} must be a mapping of spiffe_id, principal_id and kind`);
 				return;
 			}
 			for (const k of Object.keys(p)) {
-				if (k !== "common_name" && k !== "kind") errors.push(`identity.mtls.principals[${i}]: unknown key ${k}`);
+				if (k !== "spiffe_id" && k !== "principal_id" && k !== "kind") errors.push(`${prefix}: unknown key ${k}`);
 			}
-			principals.push({ commonName: p.common_name, kind: p.kind as PrincipalKind });
+			const spiffeId = typeof p.spiffe_id === "string" ? p.spiffe_id : "";
+			const principalId = typeof p.principal_id === "string" ? p.principal_id : "";
+			const kind = String(p.kind ?? "");
+			if (!spiffeIdPattern.test(spiffeId))
+				errors.push(`${prefix}.spiffe_id must be a SPIFFE ID (spiffe://<trust-domain>/<path>)`);
+			else if (ids.has(spiffeId)) errors.push(`${prefix}.spiffe_id ${spiffeId} is declared twice`);
+			ids.add(spiffeId);
+			if (!routeIdPattern.test(principalId)) errors.push(`${prefix}.principal_id must be a contract Id`);
+			if (!["workflow", "sidecar", "control"].includes(kind))
+				errors.push(`${prefix}.kind must be workflow, sidecar or control`);
+			principals.push({ spiffeId, principalId, kind: kind as PrincipalKind });
 		});
 	}
 	if (identityMode === "mtls") {
@@ -489,18 +538,23 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 		prefix: str(raw, "store.s3.prefix"),
 		pathStyle: attempt(() => bool(raw, "store.s3.path_style"), true),
 		qualifyOnStart: attempt(() => bool(raw, "store.s3.qualify_on_start"), true),
-		accessKeyId: str(raw, "store.s3.access_key_id"),
-		secretAccessKey: str(raw, "store.s3.secret_access_key"),
+		accessKeyId: secretFrom(raw, "store.s3.access_key_id", errors),
+		secretAccessKey: secretFrom(raw, "store.s3.secret_access_key", errors),
 	};
 	if (identityMode !== "disabled") {
 		if (backend === "filesystem" && !storeDir)
 			errors.push("ANVILKIT_MODEL_PROXY_STORE_DIR (store.dir) is required for store.backend filesystem");
 		if (backend === "s3" && (!s3.endpoint || !s3.bucket || !s3.accessKeyId || !s3.secretAccessKey)) {
 			errors.push(
-				"ANVILKIT_MODEL_PROXY_STORE_S3_{ENDPOINT,BUCKET,ACCESS_KEY_ID,SECRET_ACCESS_KEY} are required for store.backend s3",
+				"ANVILKIT_MODEL_PROXY_STORE_S3_{ENDPOINT,BUCKET,ACCESS_KEY_ID,SECRET_ACCESS_KEY} are required for store.backend s3 (the key pair also as ANVILKIT_MODEL_PROXY_STORE_S3_{ACCESS_KEY_ID,SECRET_ACCESS_KEY}_FILE)",
 			);
 		}
 	}
+	// P0.6: the evidence store is reached over verified TLS outside development.
+	if (s3.endpoint && !development && !s3.endpoint.startsWith("https://"))
+		errors.push(
+			"store.s3.endpoint must be https:// outside development (plaintext http:// requires development.enabled: true, DEVELOPMENT_ONLY)",
+		);
 	const routesRaw = get(raw, "routes");
 	const routes: Route[] = [];
 	if (!Array.isArray(routesRaw)) {

@@ -76,24 +76,82 @@ export class DevelopmentIdentity implements Identity {
 	}
 }
 
-/** Workload mTLS: the client certificate's common name selects the principal. */
-export class MtlsIdentity implements Identity {
-	private readonly byName = new Map<string, Principal>();
+/**
+ * Splits Node's subjectaltname string ("DNS:a, IP Address:127.0.0.1,
+ * URI:spiffe://…"): entries are separated by ", " and a value with a comma,
+ * a quote, a backslash or a control character is a JSON string literal
+ * ('URI:"…"'), so a comma never splits inside a value. Returns undefined for
+ * text that does not follow that form.
+ */
+export function parseSubjectAltName(text: string): { type: string; value: string }[] | undefined {
+	const out: { type: string; value: string }[] = [];
+	let i = 0;
+	while (i < text.length) {
+		const colon = text.indexOf(":", i);
+		if (colon <= i) return undefined;
+		const type = text.slice(i, colon);
+		let end: number;
+		let value: string;
+		if (text[colon + 1] === '"') {
+			end = colon + 2;
+			while (end < text.length && text[end] !== '"') end += text[end] === "\\" ? 2 : 1;
+			if (end >= text.length) return undefined;
+			end++;
+			try {
+				value = JSON.parse(text.slice(colon + 1, end)) as string;
+			} catch {
+				return undefined;
+			}
+		} else {
+			const next = text.indexOf(", ", colon + 1);
+			end = next < 0 ? text.length : next;
+			value = text.slice(colon + 1, end);
+		}
+		out.push({ type, value });
+		if (end === text.length) break;
+		if (!text.startsWith(", ", end)) return undefined;
+		i = end + 2;
+		if (i === text.length) return undefined;
+	}
+	return out;
+}
 
-	constructor(principals: { commonName: string; kind: Principal["kind"] }[]) {
-		for (const p of principals) this.byName.set(p.commonName, { id: p.commonName, kind: p.kind });
+/**
+ * The SPIFFE ID of a client certificate: its single URI SAN, which must be a
+ * spiffe:// URI (an X.509-SVID carries exactly one URI SAN). No URI, several
+ * URIs (two SPIFFE IDs among them), another scheme or an unparseable list is
+ * no identity.
+ */
+export function spiffeIdOf(subjectAltName: string | undefined): string | undefined {
+	const names = parseSubjectAltName(subjectAltName ?? "");
+	const uris = names?.filter((n) => n.type === "URI") ?? [];
+	if (uris.length !== 1) return undefined;
+	const uri = (uris[0] as { value: string }).value;
+	return /^spiffe:\/\/[^/]+\/.+/.test(uri) ? uri : undefined;
+}
+
+/**
+ * Workload mTLS (F-P0.1-1): the TLS layer verified the client certificate
+ * against the watched bundle; its SPIFFE ID selects the configured principal
+ * (identity.mtls.principals: spiffe_id -> principal_id, kind). The common
+ * name is not consulted.
+ */
+export class MtlsIdentity implements Identity {
+	private readonly bySpiffeId = new Map<string, Principal>();
+
+	constructor(principals: { spiffeId: string; principalId: string; kind: Principal["kind"] }[]) {
+		for (const p of principals) this.bySpiffeId.set(p.spiffeId, { id: p.principalId, kind: p.kind });
 	}
 
 	describe(): string {
-		return `mtls client certificates (${this.byName.size} principals)`;
+		return `mtls client certificates by SPIFFE ID (${this.bySpiffeId.size} principals)`;
 	}
 
 	authenticate(req: IncomingMessage): Principal | undefined {
 		const socket = req.socket as TLSSocket;
 		if (typeof socket.getPeerCertificate !== "function" || !socket.authorized) return undefined;
-		const cert = socket.getPeerCertificate();
-		const cn = cert?.subject?.CN;
-		return typeof cn === "string" && cn ? this.byName.get(cn) : undefined;
+		const id = spiffeIdOf(socket.getPeerCertificate()?.subjectaltname);
+		return id === undefined ? undefined : this.bySpiffeId.get(id);
 	}
 }
 
@@ -145,8 +203,8 @@ export function createServer(d: HttpDeps): Server {
 	if (d.cfg.identity.mode === "mtls") {
 		// The watcher holds the validated material; every update it publishes
 		// becomes the listener's secure context for new connections (leaf and
-		// CA alike). The principal mapping stays the certificate common name
-		// (follow-up F-P0.1-1: the URI SAN form).
+		// CA alike). The principal is the configured mapping of the client
+		// certificate's SPIFFE ID (F-P0.1-1, MtlsIdentity).
 		const m = d.cfg.identity.mtls;
 		const watcher =
 			d.identityWatcher ?? new IdentityWatcher({ certFile: m.certFile, keyFile: m.keyFile, caFile: m.caFile }, 5000);
