@@ -110,8 +110,8 @@ importers:
   .:
     dependencies:
       '@anvilkit/generated-clients':
-        specifier: github:ancyloce/anvilkit-agent-contracts#7d53c8e50386b2ae9b640d11e12c2cfc7d912bd8&path:ts
-        version: https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/7d53c8e50386b2ae9b640d11e12c2cfc7d912bd8#path:ts
+        specifier: github:ancyloce/anvilkit-agent-contracts#1307fb26895509b690e315bab3dd180ad3a0c4e6&path:ts
+        version: https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/1307fb26895509b690e315bab3dd180ad3a0c4e6#path:ts
       '@aws-sdk/client-s3':
         specifier: 3.1134.0
         version: 3.1134.0
@@ -191,8 +191,8 @@ packages:
       zod:
         optional: true
 
-  '@anvilkit/generated-clients@https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/7d53c8e50386b2ae9b640d11e12c2cfc7d912bd8#path:ts':
-    resolution: {gitHosted: true, integrity: sha512-n3PvXH2ke7sm9JFedTZa2cL2OTyjF7tpLqXoWRTBQ+SvCmeYDNb3uCEOvo8gzNdpcwRT6gycWIh1Vwm0fM9g+w==, path: ts, tarball: https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/7d53c8e50386b2ae9b640d11e12c2cfc7d912bd8}
+  '@anvilkit/generated-clients@https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/1307fb26895509b690e315bab3dd180ad3a0c4e6#path:ts':
+    resolution: {gitHosted: true, integrity: sha512-pcd7yItw3gsMRWKzKlSM7720GWt0+Fn67xxpCYrOJawOlczl/wC0ItDVf2Hap9CCV3oh/gVvs16ma+9zoh8wGg==, path: ts, tarball: https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/1307fb26895509b690e315bab3dd180ad3a0c4e6}
     version: 0.1.0
 
   '@aws-crypto/sha256-browser@5.2.0':
@@ -1383,7 +1383,7 @@ snapshots:
     optionalDependencies:
       zod: 4.6.5
 
-  '@anvilkit/generated-clients@https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/7d53c8e50386b2ae9b640d11e12c2cfc7d912bd8#path:ts':
+  '@anvilkit/generated-clients@https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/1307fb26895509b690e315bab3dd180ad3a0c4e6#path:ts':
     dependencies:
       '@bufbuild/protobuf': 2.15.0
       '@bufbuild/protovalidate': 1.2.0(@bufbuild/protobuf@2.15.0)
