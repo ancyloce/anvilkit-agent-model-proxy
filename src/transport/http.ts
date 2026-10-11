@@ -190,15 +190,52 @@ async function readBody(req: IncomingMessage, limit: number): Promise<string> {
 
 const callPath = /^\/api\/v1\/model-calls\/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})(\/cancellations)?$/;
 
+/**
+ * The request target as a URL, or undefined for a target the URL parser
+ * refuses (`//`, `/%`, an authority form, …): answered 400, never thrown
+ * (P1.3, review finding B-28: an unparseable target must not end the
+ * process).
+ */
+export function parseTarget(target: string | undefined): URL | undefined {
+	const t = target ?? "/";
+	if (!t.startsWith("/") || t.startsWith("//")) return undefined;
+	try {
+		return new URL(t, "http://proxy");
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * A client whose request the parser refused (an oversized request line or
+ * header block, a malformed line) is answered 400 and the connection closed;
+ * the process and every other connection are unaffected (P1.3, B-28).
+ */
+function answerClientError(err: Error & { code?: string }, socket: import("node:net").Socket): void {
+	if (err.code === "ECONNRESET" || !socket.writable) {
+		socket.destroy();
+		return;
+	}
+	socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+}
+
 /** The business listener: plaintext under the development identity, TLS with mandatory client certificates under mtls. */
 export function createServer(d: HttpDeps): Server {
 	const handler = (req: IncomingMessage, res: ServerResponse) => {
+		const target = parseTarget(req.url);
 		if (d.observer) {
-			const pathname = new URL(req.url ?? "/", "http://proxy").pathname;
-			const done = d.observer.request(req.method ?? "GET", routeOf(pathname), req.headers);
+			const done = d.observer.request(req.method ?? "GET", target ? routeOf(target.pathname) : "invalid", req.headers);
 			res.once("close", () => done(res.statusCode));
 		}
-		void handle(d, req, res);
+		handle(d, req, res, target).catch((err) => {
+			// handle() answers its own failures; this is the last guard of the
+			// listener: nothing thrown here reaches the process (P1.3, B-28).
+			d.log.error("request handler failed outside its guard", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+			if (!res.headersSent) writeError(res, requestId(), "DEPENDENCY_UNAVAILABLE", "internal failure", true);
+			else res.destroy();
+		});
 	};
 	if (d.cfg.identity.mode === "mtls") {
 		// The watcher holds the validated material; every update it publishes
@@ -227,9 +264,12 @@ export function createServer(d: HttpDeps): Server {
 			watcher.start();
 			server.once("close", () => watcher.stop());
 		}
+		server.on("clientError", answerClientError);
 		return server;
 	}
-	return createHttpServer(handler);
+	const server = createHttpServer(handler);
+	server.on("clientError", answerClientError);
+	return server;
 }
 
 /**
@@ -238,9 +278,20 @@ export function createServer(d: HttpDeps): Server {
  * process metrics when given; nothing else is served and no identity is
  * checked, so it must not be exposed beyond the Pod (probes and scraping).
  */
-export function createHealthServer(ready: () => boolean, metrics?: Registry): Server {
-	return createHttpServer((req, res) => {
-		const url = new URL(req.url ?? "/", "http://proxy");
+export function createHealthServer(ready: () => boolean, metrics?: Registry, drain?: () => void): Server {
+	const server = createHttpServer((req, res) => {
+		const url = parseTarget(req.url);
+		if (!url) {
+			res.writeHead(400, { "content-type": "text/plain", "cache-control": "no-store" }).end("bad request");
+			return;
+		}
+		// The preStop path (P1.3): readiness is withdrawn before the drain
+		// starts; nothing else changes. Pod-local, like the probes.
+		if (drain && req.method === "GET" && url.pathname === "/drain") {
+			drain();
+			res.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" }).end("draining");
+			return;
+		}
 		if (metrics && req.method === "GET" && url.pathname === "/metrics") {
 			void metrics.metrics().then(
 				(body) => res.writeHead(200, { "content-type": metrics.contentType, "cache-control": "no-store" }).end(body),
@@ -261,11 +312,16 @@ export function createHealthServer(ready: () => boolean, metrics?: Registry): Se
 		}
 		res.writeHead(404, { "content-type": "text/plain" }).end("not found");
 	});
+	server.on("clientError", answerClientError);
+	return server;
 }
 
-async function handle(d: HttpDeps, req: IncomingMessage, res: ServerResponse): Promise<void> {
+async function handle(d: HttpDeps, req: IncomingMessage, res: ServerResponse, url: URL | undefined): Promise<void> {
 	const id = requestId();
-	const url = new URL(req.url ?? "/", "http://proxy");
+	if (!url) {
+		writeError(res, id, "INVALID_ARGUMENT", "the request target is not a valid path", false);
+		return;
+	}
 	try {
 		const principal = d.identity.authenticate(req);
 		if (!principal) {

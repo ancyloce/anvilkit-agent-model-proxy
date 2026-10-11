@@ -26,6 +26,20 @@ import {
 
 export async function run(cfg: Config): Promise<void> {
 	const log = jsonLogger();
+	// A defect that escapes every guard is logged and the process goes on
+	// (P1.3, B-28/B-29): an exit would cut every in-flight paid send of the
+	// replica and reclaim each as unknown. The affected call, if any, ends
+	// through its own paths (bounds, deadline, the sweep).
+	process.on("uncaughtException", (err) => {
+		log.error("uncaught exception; the process continues", {
+			error: err instanceof Error ? `${err.name}: ${err.message}` : String(err),
+		});
+	});
+	process.on("unhandledRejection", (reason) => {
+		log.error("unhandled rejection; the process continues", {
+			error: reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason),
+		});
+	});
 	if (disabled(cfg)) {
 		throw new Error(
 			"profile disabled: identity.mode is disabled (no trusted identity input for this environment); nothing is served",
@@ -78,16 +92,32 @@ export async function run(cfg: Config): Promise<void> {
 	const server = createServer({ cfg, contract, calls, identity, identityWatcher, log, observer: telemetry });
 	server.requestTimeout = 0;
 	server.headersTimeout = cfg.http.requestHeaderTimeoutMs;
-	const health = createHealthServer(() => ready, telemetry.registry);
+	const health = createHealthServer(
+		() => ready,
+		telemetry.registry,
+		() => {
+			ready = false;
+		},
+	);
 	// The probe listener is up first: the kubelet's startup probe finds the
 	// process, /readyz answers 503 until the service is serving.
 	await listen(health, cfg.health.listen);
 	await listen(server, cfg.http.listen);
-	const first = await calls.sweep();
-	const sweep = setInterval(
-		() => void calls.sweep().catch((err) => log.error("sweep failed", { error: String(err) })),
-		cfg.observation.sweepIntervalMs,
-	);
+	// The sweep is off the readiness path (P1.3, MP-07): the first pass runs
+	// beside serving, and every pass is bounded (observation.sweep_batch).
+	const runSweep = () =>
+		calls.sweep().then(
+			(r) =>
+				log.info("sweep pass", {
+					resubmitted: r.resubmitted,
+					reclaimed: r.reclaimed,
+					completed: r.completed,
+					expired: r.expired,
+				}),
+			(err) => log.error("sweep failed", { error: String(err) }),
+		);
+	void runSweep();
+	const sweep = setInterval(() => void runSweep(), cfg.observation.sweepIntervalMs);
 	ready = true;
 	log.info("model proxy serving", {
 		listen: cfg.http.listen,
@@ -96,17 +126,24 @@ export async function run(cfg: Config): Promise<void> {
 		store: objects.describe(),
 		control: cfg.control.address,
 		instanceId,
-		resubmitted: first.resubmitted,
-		reclaimed: first.reclaimed,
-		completed: first.completed,
 	});
 	await new Promise<void>((resolve) => {
 		const stop = () => {
+			// The drain (P1.3, MP-05): readiness withdrawn, new opens refused as
+			// retryable, the listener closed to new connections, in-flight sends
+			// run to their bounded end and are settled and observed; the bound
+			// covers the longest route send (validated by the configuration).
 			ready = false;
+			calls.beginClose();
 			clearInterval(sweep);
-			log.info("shutdown requested", { inFlight: calls.inFlight });
+			log.info("shutdown requested", { inFlight: calls.inFlight, boundMs: cfg.http.shutdownTimeoutMs });
 			server.close();
-			const bound = setTimeout(() => resolve(), cfg.http.shutdownTimeoutMs);
+			const bound = setTimeout(() => {
+				log.error("drain bound reached with sends in flight; they are reclaimed by the sweep", {
+					inFlight: calls.inFlight,
+				});
+				resolve();
+			}, cfg.http.shutdownTimeoutMs);
 			void calls.close().then(() => {
 				clearTimeout(bound);
 				resolve();

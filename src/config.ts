@@ -119,6 +119,12 @@ export interface Config {
 		retryMaxIntervalMs: number;
 		sweepIntervalMs: number;
 		reclaimGraceMs: number;
+		/** Entries one sweep pass handles at most per index (reclaimed watches, expirations): the pass is bounded. */
+		sweepBatch: number;
+		/** Per-kind retention of the store (P1.3, MP-07): terminal records, evidence and cancel intents older than these are removed by the sweep. */
+		retentionCallsMs: number;
+		retentionEvidenceMs: number;
+		retentionCancelMs: number;
 	};
 	contractsDir: string;
 	routes: Route[];
@@ -239,7 +245,16 @@ const defaults: Raw = {
 		backend: "filesystem",
 		s3: { region: "default", prefix: "model-proxy", path_style: true, qualify_on_start: true },
 	},
-	observation: { retry_initial: "1s", retry_max_interval: "30s", sweep_interval: "30s", reclaim_grace: "30s" },
+	observation: {
+		retry_initial: "1s",
+		retry_max_interval: "30s",
+		sweep_interval: "30s",
+		reclaim_grace: "30s",
+		sweep_batch: 200,
+		retention_calls: "168h",
+		retention_evidence: "720h",
+		retention_cancel: "48h",
+	},
 	routes: [],
 };
 
@@ -281,6 +296,10 @@ const knownKeys = new Set([
 	"observation.retry_max_interval",
 	"observation.sweep_interval",
 	"observation.reclaim_grace",
+	"observation.sweep_batch",
+	"observation.retention_calls",
+	"observation.retention_evidence",
+	"observation.retention_cancel",
 	"routes",
 ]);
 
@@ -707,7 +726,7 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 			requestHeaderTimeoutMs: attempt(() => duration(raw, "http.request_header_timeout", 1000, 600_000), 1000),
 			sseHeartbeatMs: attempt(() => duration(raw, "http.sse_heartbeat", 1000, 600_000), 1000),
 			slowConsumerGraceMs: attempt(() => duration(raw, "http.slow_consumer_grace", 1000, 600_000), 1000),
-			shutdownTimeoutMs: attempt(() => duration(raw, "http.shutdown_timeout", 1000, 300_000), 1000),
+			shutdownTimeoutMs: attempt(() => duration(raw, "http.shutdown_timeout", 1000, 3_700_000), 1000),
 		},
 		health: { listen: healthListen },
 		telemetry: { otlpEndpoint, sampleRatio },
@@ -728,6 +747,19 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 			retryMaxIntervalMs: attempt(() => duration(raw, "observation.retry_max_interval", 10, 600_000), 10),
 			sweepIntervalMs: attempt(() => duration(raw, "observation.sweep_interval", 1000, 3_600_000), 1000),
 			reclaimGraceMs: attempt(() => duration(raw, "observation.reclaim_grace", 0, 3_600_000), 0),
+			sweepBatch: attempt(() => int(raw, "observation.sweep_batch", 1, 10_000), 1),
+			retentionCallsMs: attempt(
+				() => duration(raw, "observation.retention_calls", 3_600_000, 8760 * 3_600_000),
+				3_600_000,
+			),
+			retentionEvidenceMs: attempt(
+				() => duration(raw, "observation.retention_evidence", 3_600_000, 8760 * 3_600_000),
+				3_600_000,
+			),
+			retentionCancelMs: attempt(
+				() => duration(raw, "observation.retention_cancel", 3_600_000, 8760 * 3_600_000),
+				3_600_000,
+			),
 		},
 		contractsDir: str(raw, "contracts.dir"),
 		routes,
@@ -738,6 +770,19 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 	}
 	if (cfg.observation.retryMaxIntervalMs < cfg.observation.retryInitialMs) {
 		errors.push("observation.retry_max_interval must be at least observation.retry_initial");
+	}
+	// P1.3 (MP-05): the drain covers the longest send an enabled route may
+	// hold plus its settlement, so a rollout never cuts a send it admitted.
+	const longestSend = Math.max(0, ...cfg.routes.filter((r) => r.enabled).map((r) => r.limits.upstreamTimeoutMs));
+	if (longestSend > 0 && cfg.http.shutdownTimeoutMs < longestSend + 10_000) {
+		errors.push(
+			`http.shutdown_timeout (${cfg.http.shutdownTimeoutMs}ms) must cover the longest enabled route upstream_timeout plus 10s of settlement (${longestSend + 10_000}ms)`,
+		);
+	}
+	if (cfg.observation.retentionCallsMs < 24 * 3_600_000 + 2 * cfg.observation.reclaimGraceMs) {
+		errors.push(
+			"observation.retention_calls must be at least 24h (the longest route deadline) plus twice the reclaim grace",
+		);
 	}
 	if (errors.length > 0) {
 		throw new ConfigError(errors.join("\n"));
