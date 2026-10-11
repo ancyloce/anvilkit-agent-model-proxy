@@ -15,10 +15,11 @@
 // was recorded for. Control keeps the ledger; this service keeps the
 // sender's transport state.
 
-import { ControlRefused, type DispatchPort } from "../adapters/control.js";
+import { randomBytes } from "node:crypto";
+import { ControlCapacityExhausted, ControlRefused, type DispatchPort } from "../adapters/control.js";
 import { streamUpstream } from "../adapters/piai.js";
 import { type CallStore, evidenceKeyOf, type NativeEvidence, PreconditionFailed } from "../adapters/store.js";
-import { nativeUsageFromSse, SendTicket } from "../adapters/transport.js";
+import { SendTicket } from "../adapters/transport.js";
 import type { Config, Route } from "../config.js";
 import { routeDisabledReasons } from "../config.js";
 import {
@@ -127,6 +128,7 @@ const keyOf = (scope: CallScope) => `${scope.callId}/${scope.tenantId}`;
 export class CallService {
 	private readonly live = new Map<string, LiveCall>();
 	private readonly retrying = new Set<string>();
+	private reclaimedCursor = 0;
 	private readonly now: () => number;
 	private readonly pollMs: number;
 	private closing = false;
@@ -336,6 +338,11 @@ export class CallService {
 			this.reentry(principal, existing.record, req, contentDigest);
 			return this.attach(existing.record, Date.parse(existing.record.deadline));
 		}
+		// A draining process admits nothing new (P1.3): the caller retries the
+		// same call id on another replica; nothing was asked of Control.
+		if (this.closing) {
+			throw new CallError("DEPENDENCY_UNAVAILABLE", "the Proxy is draining; retry the call on another replica", true);
+		}
 		const { route, deadlineMs } = this.validate(req);
 		const admission = await this.admit(principal, req, route);
 		const nowIso = timestamp(this.now());
@@ -359,6 +366,8 @@ export class CallService {
 			revision: 1,
 			frames: [],
 			observations: [],
+			createdBy: this.source,
+			createNonce: randomBytes(8).toString("hex"),
 		};
 		if (admission.denialCode) {
 			const record = { ...base, state: "denied" as const, errorCode: admission.denialCode };
@@ -540,6 +549,15 @@ export class CallService {
 				}
 			}
 		}
+		if (lastErr instanceof ControlCapacityExhausted) {
+			// Control's pool is full: nothing was decided about the call. The
+			// caller retries later under the same call id (P1.3, MP-04).
+			throw new CallError(
+				"DEPENDENCY_UNAVAILABLE",
+				`Control is at capacity; retry the call later: ${lastErr.message}`,
+				true,
+			);
+		}
 		throw new CallError(
 			"DEPENDENCY_UNAVAILABLE",
 			`Control did not answer the admission of ${req.callId}: ${(lastErr as Error)?.message ?? lastErr}`,
@@ -567,6 +585,16 @@ export class CallService {
 			if (!(err instanceof PreconditionFailed)) throw err;
 			const found = await this.d.store.read(scopeOf(record));
 			if (!found) throw err;
+			// The create landed but its answer was lost and the SDK repeated
+			// it (P1.3, MP-10): the record carries this instance's stamp and
+			// this attempt's nonce, so it is this write, not another's.
+			if (
+				record.createNonce !== undefined &&
+				found.record.createdBy === record.createdBy &&
+				found.record.createNonce === record.createNonce
+			) {
+				return { record: found.record, version: found.version, created: true };
+			}
 			return { record: found.record, version: found.version, created: false };
 		}
 	}
@@ -665,12 +693,18 @@ export class CallService {
 		// Cancellation is durable intent: a cancel that reached another
 		// instance is seen by the sender through the store.
 		const cancelPoll = setInterval(() => {
-			void this.d.store.cancelRequested(scope).then((at) => {
-				if (at && !live.abort.signal.aborted) {
-					live.cancelReason ??= "cancel";
-					live.abort.abort();
-				}
-			});
+			this.d.store.cancelRequested(scope).then(
+				(at) => {
+					if (at && !live.abort.signal.aborted) {
+						live.cancelReason ??= "cancel";
+						live.abort.abort();
+					}
+				},
+				// A store fault never ends the process (P1.3, B-29): the intent
+				// is read again at the next tick.
+				(err) =>
+					this.d.log.warn("cancel intent not readable; polled again", { callId: record.callId, error: String(err) }),
+			);
 		}, this.pollMs);
 		let upstreamError: string | undefined;
 		try {
@@ -730,9 +764,11 @@ export class CallService {
 			dispatchId: record.dispatchId,
 			routeId: route.id,
 			capturedAt: timestamp(this.now()),
-			request: ticket.request ?? { method: "", url: "", contentType: "", body: "", bodyTruncated: false },
+			request: ticket.request ?? { method: "", url: "", contentType: "", body: "", bodyTruncated: false, bodyBytes: 0 },
+			wireAttempts: ticket.wireAttempts,
 			settlement,
 		};
+		if (ticket.refused.length > 0) evidence.refusedSends = [...ticket.refused];
 		if (ticket.response) {
 			evidence.response = {
 				status: ticket.response.status,
@@ -751,6 +787,7 @@ export class CallService {
 			errorCode: settlement.errorCode,
 			frames: frames.count,
 			upstreamStatus: ticket.response?.status,
+			wireAttempts: ticket.wireAttempts,
 			refusedSends: ticket.refused.length,
 			durationMs: this.now() - startedAt,
 		});
@@ -804,12 +841,18 @@ export class CallService {
 		frames: Frames,
 		callId: string,
 	): Settlement {
-		const native = ticket.response ? nativeUsageFromSse(ticket.response.body) : undefined;
+		// The usage is parsed from the whole stream as it arrived, never from
+		// the evidence capture (which the evidence bound may truncate).
+		const native = ticket.response ? ticket.usage.result() : undefined;
 		const report = native ? usageFromOpenAI(native.usage) : undefined;
-		const usage = report?.kind === "complete" ? report.usage : undefined;
+		// Counters of a stream that did not reach its end are a lower bound,
+		// never a settlement (P1.3, MP-06).
+		const complete = ticket.streamComplete;
+		const usage = report?.kind === "complete" && complete ? report.usage : undefined;
 		let nativeReference: string | undefined;
 		if (native?.responseId) nativeReference = native.responseId;
 		else if (ticket.response?.headers["x-request-id"]) nativeReference = ticket.response.headers["x-request-id"];
+		if (nativeReference !== undefined) nativeReference = nativeReference.slice(0, 256);
 		const okStatus = ticket.response !== undefined && ticket.response.status >= 200 && ticket.response.status < 300;
 		let outcome: Outcome;
 		let errorCode: string | undefined;
@@ -836,6 +879,11 @@ export class CallService {
 		} else if (upstreamError !== undefined || !okStatus) {
 			outcome = usage ? "failed" : "unknown";
 			errorCode = ticket.response && !okStatus ? `UPSTREAM_STATUS_${ticket.response.status}` : "UPSTREAM_ERROR";
+		} else if (report?.kind === "complete" && !complete) {
+			// The counters arrived but the stream was cut before its end: what
+			// they count is a lower bound, not the send's usage.
+			outcome = "unknown";
+			errorCode = "USAGE_INCOMPLETE";
 		} else if (!report) {
 			// The stream completed but no chunk carried usage: the text is
 			// delivered, the cost is unknown, never zero.
@@ -852,6 +900,12 @@ export class CallService {
 			});
 		} else {
 			outcome = "succeeded";
+		}
+		if (outcome === "unknown" && ticket.secondSendRefused) {
+			// A layer beneath the vendor client tried a second wire send; the
+			// dispatcher refused it. The single response (or its absence) is
+			// what the outcome rests on; the refusal names the cause.
+			errorCode = "SENDER_REFUSED";
 		}
 		try {
 			if (outcome === "succeeded" && settledUsage) {
@@ -1153,7 +1207,21 @@ export class CallService {
 		this.retrying.add(key);
 		try {
 			let delay = this.d.cfg.observation.retryInitialMs;
-			while (!(await this.submitPending(scope))) {
+			for (;;) {
+				let done: boolean;
+				try {
+					done = await this.submitPending(scope);
+				} catch (err) {
+					// A store fault (read, conditional write) is a failed pass, never
+					// an unhandled rejection (P1.3, B-29): the pass is repeated, and
+					// the sweep finds the marker after a restart.
+					this.d.log.warn("observation pass failed on the store; repeated", {
+						callId: scope.callId,
+						error: String(err),
+					});
+					done = false;
+				}
+				if (done) return;
 				if (this.closing) return;
 				await sleep(delay);
 				delay = Math.min(delay * 2, this.d.cfg.observation.retryMaxIntervalMs);
@@ -1184,7 +1252,7 @@ export class CallService {
 	 * evidence is watched, one read per pass, for as long as it takes. A send
 	 * this process owns is never touched.
 	 */
-	async sweep(): Promise<{ resubmitted: number; reclaimed: number; completed: number }> {
+	async sweep(): Promise<{ resubmitted: number; reclaimed: number; completed: number; expired: number }> {
 		let resubmitted = 0;
 		let reclaimed = 0;
 		let completed = 0;
@@ -1258,8 +1326,19 @@ export class CallService {
 				await this.release(scope, rec);
 			}
 		}
-		for (const scope of await this.d.store.listReclaimed()) {
-			if (this.live.has(keyOf(scope)) || visited.has(keyOf(scope))) continue;
+		// The reclaimed watches are read in bounded rotation: at most
+		// sweepBatch per pass, continuing where the last pass stopped.
+		const reclaimedAll = (await this.d.store.listReclaimed()).filter(
+			(scope) => !this.live.has(keyOf(scope)) && !visited.has(keyOf(scope)),
+		);
+		const batch = this.d.cfg.observation.sweepBatch;
+		const start = reclaimedAll.length === 0 ? 0 : this.reclaimedCursor % reclaimedAll.length;
+		const reclaimedPage = reclaimedAll.slice(start, start + batch);
+		for (const scope of reclaimedAll.slice(0, Math.max(0, batch - reclaimedPage.length))) {
+			if (!reclaimedPage.includes(scope)) reclaimedPage.push(scope);
+		}
+		this.reclaimedCursor = start + reclaimedPage.length;
+		for (const scope of reclaimedPage) {
 			const evidence = await this.d.store.readEvidence(scope);
 			if (!evidence?.settlement) continue; // still lost: watched, never released
 			const found = await this.d.store.read(scope);
@@ -1300,7 +1379,67 @@ export class CallService {
 				await this.d.store.clearReclaimed(scope);
 			}
 		}
-		return { resubmitted, reclaimed, completed };
+		const expired = await this.expire(batch);
+		return { resubmitted, reclaimed, completed, expired };
+	}
+
+	/**
+	 * Per-kind retention (P1.3, MP-07), bounded per pass: a terminal record
+	 * whose observations Control took and that owes nothing more (its
+	 * evidence taken, or denied, or a lost permission past its window) goes
+	 * after retention_calls; the evidence of a record that is gone or
+	 * terminal-and-settled after retention_evidence; a cancel intent of a
+	 * record that is gone or terminal after retention_cancel. A record
+	 * reclaimed as unknown without evidence is never expired: it is watched.
+	 */
+	private async expire(batch: number): Promise<number> {
+		const now = this.now();
+		const r = this.d.cfg.observation;
+		let removed = 0;
+		const terminalRecords = new Map<string, CallRecord>();
+		for (const scope of await this.d.store.listAllCalls()) {
+			if (removed >= batch) break;
+			if (this.live.has(keyOf(scope))) continue;
+			const found = await this.d.store.read(scope);
+			if (!found) continue;
+			const rec = found.record;
+			if (!isTerminal(rec.state)) continue;
+			if (rec.observations.some((o) => !o.submitted)) continue;
+			if (rec.reclaimedAt !== undefined && rec.evidenceRef === undefined) continue; // watched for evidence
+			if (!this.releasable(rec)) continue;
+			terminalRecords.set(keyOf(scope), rec);
+			if (now - Date.parse(rec.updatedAt) < r.retentionCallsMs) continue;
+			await this.d.store.clearPending(scope);
+			await this.d.store.clearReclaimed(scope);
+			await this.d.store.deleteRecord(scope);
+			removed++;
+		}
+		for (const scope of await this.d.store.listAllEvidence()) {
+			if (removed >= batch) break;
+			if (this.live.has(keyOf(scope))) continue;
+			const ev = await this.d.store.readEvidence(scope);
+			if (!ev || now - Date.parse(ev.capturedAt) < r.retentionEvidenceMs) continue;
+			const rec = terminalRecords.get(keyOf(scope)) ?? (await this.d.store.read(scope))?.record;
+			if (rec && !(isTerminal(rec.state) && rec.evidenceRef !== undefined)) continue;
+			await this.d.store.deleteEvidence(scope);
+			removed++;
+		}
+		for (const scope of await this.d.store.listAllCancels()) {
+			if (removed >= batch) break;
+			if (this.live.has(keyOf(scope))) continue;
+			const at = await this.d.store.cancelRequested(scope);
+			if (!at || now - Date.parse(at) < r.retentionCancelMs) continue;
+			const rec = (await this.d.store.read(scope))?.record;
+			if (rec && !isTerminal(rec.state)) continue;
+			await this.d.store.clearCancel(scope);
+			removed++;
+		}
+		return removed;
+	}
+
+	/** Refuses new opens from now on; reentries and queries keep being answered (P1.3 drain). */
+	beginClose(): void {
+		this.closing = true;
 	}
 
 	/** Stops retry loops; in-flight sends run to their end (bounded by their deadlines). */
