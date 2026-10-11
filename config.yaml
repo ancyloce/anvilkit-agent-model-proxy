@@ -30,7 +30,11 @@ http:
   request_header_timeout: 10s
   sse_heartbeat: 15s
   slow_consumer_grace: 10s
-  shutdown_timeout: 20s
+  # The drain: readiness withdrawn, new calls refused (retryable), in-flight
+  # sends run to their bounded end and are settled and observed. It must
+  # cover the longest enabled route's upstream_timeout plus 10s of settlement
+  # (validated); the chart's grace period must exceed it.
+  shutdown_timeout: 330s
 identity:
   # disabled | development (bearer principals file, DEVELOPMENT_ONLY) | mtls
   # (client certificates of the workload identity, ENV-03). Under mtls a
@@ -89,6 +93,17 @@ observation:
   retry_max_interval: 30s
   sweep_interval: 30s
   reclaim_grace: 30s
+  # One sweep pass handles at most sweep_batch reclaimed watches and
+  # expirations: the pass is bounded and never on the readiness path.
+  sweep_batch: 200
+  # Per-kind retention (P1.3): terminal records whose observations were
+  # taken by Control, evidence of such records and cancel intents older than
+  # these are removed by the sweep. retention_calls must exceed the longest
+  # route deadline (24h) by twice the reclaim grace, so a reentry always
+  # finds its record while an operation can still run.
+  retention_calls: 168h
+  retention_evidence: 720h
+  retention_cancel: 48h
 # routes: the reviewed model routes. A route is served only when it is
 # enabled here, its credential variable is set, and its api is one of the
 # implemented and inspected SDK paths (openai-completions in this build).
