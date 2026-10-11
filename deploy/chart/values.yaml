@@ -167,7 +167,8 @@ config:
     request_header_timeout: 10s
     sse_heartbeat: 15s
     slow_consumer_grace: 10s
-    shutdown_timeout: 20s
+    # Must cover the longest enabled route upstream_timeout plus 10s (validated by the process).
+    shutdown_timeout: 330s
   identity:
     owner: anvilkit-agent-model-proxy
     mtls:
@@ -242,10 +243,15 @@ probes:
     periodSeconds: 10
     failureThreshold: 3
 
-# Shutdown: the process drains within http.shutdown_timeout of the
-# configuration (in-flight sends run to their bounded end so their usage is
-# observed); the grace period must exceed it.
-terminationGracePeriodSeconds: 30
+# Shutdown (P1.3): the preStop hook waits preStopSeconds for the endpoint
+# removal to propagate (the process withdraws readiness on SIGTERM as well),
+# then SIGTERM starts the drain: new calls are refused (retryable), in-flight
+# sends run to their bounded end (config.http.shutdown_timeout covers the
+# longest route upstream_timeout plus settlement) and their usage is
+# observed. The grace period must exceed preStopSeconds plus
+# http.shutdown_timeout plus the span flush.
+preStopSeconds: 5
+terminationGracePeriodSeconds: 360
 
 podSecurityContext:
   runAsNonRoot: true

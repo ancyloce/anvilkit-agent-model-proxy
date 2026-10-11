@@ -117,6 +117,13 @@ spec:
           # The probes target the plaintext health listener in both identity
           # modes: the kubelet presents no client certificate, and the mTLS
           # business listener refuses a handshake without one.
+          lifecycle:
+            preStop:
+              exec:
+                # Readiness goes first (the process withdraws it on SIGTERM as
+                # well); the pause lets the endpoint removal propagate before
+                # the drain starts.
+                command: ["/bin/sh", "-c", "sleep {{ .Values.preStopSeconds }}"]
           startupProbe:
             httpGet:
               path: /readyz
