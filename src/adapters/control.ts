@@ -118,22 +118,49 @@ function stateOf(s: DispatchState | undefined): AdmissionResult["state"] {
 	return name;
 }
 
-/** Maps a gRPC status to the Proxy's errors, as the Go callers' refusal() does. */
-function refusal(err: ServiceError): Error {
-	switch (err.code) {
-		case status.FAILED_PRECONDITION:
-		case status.ABORTED:
-		case status.INVALID_ARGUMENT:
-		case status.NOT_FOUND:
-		case status.PERMISSION_DENIED:
-		case status.RESOURCE_EXHAUSTED:
-		case status.DATA_LOSS: {
-			const code = (err.details || "").split(":")[0]?.trim() || status[err.code] || "REFUSED";
-			return new ControlRefused(code, err.details || err.message);
-		}
-		default:
-			return new ControlUnavailable(`control ${status[err.code] ?? err.code}: ${err.details || err.message}`);
-	}
+/** Control's pool is full: nothing was decided; the caller retries later (P1.3, MP-04). */
+export class ControlCapacityExhausted extends ControlUnavailable {}
+
+type Phase = "admit" | "observe" | "query";
+
+/**
+ * Maps a gRPC status to the Proxy's errors by what the phase can conclude
+ * from it (P1.3, review finding B-30). CAPACITY_EXHAUSTED decides nothing
+ * and is always retryable. On an admission a precondition refusal (stale
+ * execution, budget, profile, conflicting digest) is Control's decision on
+ * the call. On an observation only an answer about the dispatch identity
+ * itself — no such dispatch, not this owner's, a malformed report — is
+ * terminal; a transient refusal (resource exhaustion, a revision conflict,
+ * a failed precondition of the moment, unavailability, a deadline) keeps the
+ * observation pending under its identity and the sweep resubmits it: usage
+ * is never discarded on a transient answer.
+ */
+function refusal(err: ServiceError, phase: Phase): Error {
+	const code = (err.details || "").split(":")[0]?.trim() || status[err.code] || "REFUSED";
+	if (code === "CAPACITY_EXHAUSTED")
+		return new ControlCapacityExhausted(`control CAPACITY_EXHAUSTED: ${err.details || err.message}`);
+	// Two precondition answers are permanent facts about the dispatch itself,
+	// whatever the moment: a report without usage for a definite outcome
+	// (EFFECT_UNCERTAIN) and a dispatch that never held a permission
+	// (STALE_EXECUTION); repeating them changes nothing.
+	const permanentPrecondition =
+		err.code === status.FAILED_PRECONDITION && (code === "EFFECT_UNCERTAIN" || code === "STALE_EXECUTION");
+	const terminal =
+		phase === "observe"
+			? permanentPrecondition
+				? [status.FAILED_PRECONDITION, status.NOT_FOUND, status.PERMISSION_DENIED, status.INVALID_ARGUMENT]
+				: [status.NOT_FOUND, status.PERMISSION_DENIED, status.INVALID_ARGUMENT]
+			: [
+					status.FAILED_PRECONDITION,
+					status.ABORTED,
+					status.INVALID_ARGUMENT,
+					status.NOT_FOUND,
+					status.PERMISSION_DENIED,
+					status.RESOURCE_EXHAUSTED,
+					status.DATA_LOSS,
+				];
+	if (terminal.includes(err.code)) return new ControlRefused(code, err.details || err.message);
+	return new ControlUnavailable(`control ${status[err.code] ?? err.code}: ${err.details || err.message}`);
 }
 
 /**
@@ -209,10 +236,11 @@ export class ControlClient implements DispatchPort {
 	private call<Req, Res>(
 		fn: (req: Req, md: Metadata, opts: { deadline: Date }, cb: (err: ServiceError | null, res: Res) => void) => unknown,
 		req: Req,
+		phase: Phase,
 	): Promise<Res> {
 		return new Promise<Res>((resolve, reject) => {
 			fn.call(this.client, req, new Metadata(), { deadline: new Date(Date.now() + this.timeoutMs) }, (err, res) => {
-				if (err) reject(refusal(err));
+				if (err) reject(refusal(err, phase));
 				else resolve(res);
 			});
 		});
@@ -243,7 +271,7 @@ export class ControlClient implements DispatchPort {
 			evidenceRef: input.evidenceRef,
 		});
 		validated("anvilkit.control.v1.AdmitModelRequest", AdmitModelRequest.toJSON(req));
-		const res = await this.call(this.client.admitModel, req);
+		const res = await this.call(this.client.admitModel, req, "admit");
 		const a = res.admission;
 		if (!a?.dispatch) throw new ControlUnavailable("Control answered no admission");
 		const out: AdmissionResult = {
@@ -274,7 +302,7 @@ export class ControlClient implements DispatchPort {
 			observedAt: input.observedAt,
 		});
 		validated("anvilkit.control.v1.ObserveDispatchRequest", ObserveDispatchRequest.toJSON(req));
-		const res = await this.call(this.client.observeDispatch, req);
+		const res = await this.call(this.client.observeDispatch, req, "observe");
 		if (!res.dispatch) throw new ControlUnavailable("Control answered no dispatch");
 		return { existing: res.existing, state: stateOf(res.dispatch.state) };
 	}
@@ -283,7 +311,7 @@ export class ControlClient implements DispatchPort {
 	async getDispatch(tenantId: string, dispatchId: string): Promise<DispatchView> {
 		const req = GetDispatchRequest.fromPartial({ dispatchId, tenantId });
 		validated("anvilkit.control.v1.GetDispatchRequest", GetDispatchRequest.toJSON(req));
-		const res = await this.call(this.client.getDispatch, req);
+		const res = await this.call(this.client.getDispatch, req, "query");
 		const d = res.dispatch;
 		if (!d) throw new ControlUnavailable("Control answered no dispatch");
 		const view: DispatchView = { dispatchId: d.dispatchId, callId: d.callId, owner: d.owner, state: stateOf(d.state) };

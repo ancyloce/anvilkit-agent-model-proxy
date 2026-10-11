@@ -294,7 +294,18 @@ export interface NativeEvidence {
 	dispatchId: string;
 	routeId: string;
 	capturedAt: string;
-	request: { method: string; url: string; contentType: string; body: string; bodyTruncated: boolean };
+	request: {
+		method: string;
+		url: string;
+		contentType: string;
+		body: string;
+		bodyTruncated: boolean;
+		bodyBytes?: number;
+	};
+	/** Dispatches of the ticket that reached the wire: 0 or 1 (the dispatcher refuses a second one). */
+	wireAttempts: number;
+	/** Sends the ticket refused after its one allowed dispatch, e.g. SEND_ALREADY_ATTEMPTED. */
+	refusedSends?: string[];
 	response?: {
 		status: number;
 		headers: Record<string, string>;
@@ -445,6 +456,31 @@ export class CallStore {
 			if (scope) out.push(scope);
 		}
 		return out;
+	}
+
+	/** Every recorded call, evidence and cancel intent (retention sweeps). */
+	async listAllCalls(): Promise<CallScope[]> {
+		return this.listScopes("calls");
+	}
+
+	async listAllEvidence(): Promise<CallScope[]> {
+		return this.listScopes("evidence");
+	}
+
+	async listAllCancels(): Promise<CallScope[]> {
+		return this.listScopes("cancel");
+	}
+
+	async deleteRecord(scope: CallScope): Promise<void> {
+		await this.objects.delete(keyOf("calls", scope));
+	}
+
+	async deleteEvidence(scope: CallScope): Promise<void> {
+		await this.objects.delete(evidenceKeyOf(scope));
+	}
+
+	async clearCancel(scope: CallScope): Promise<void> {
+		await this.objects.delete(keyOf("cancel", scope));
 	}
 
 	async requestCancel(scope: CallScope, at: string): Promise<void> {
