@@ -1,7 +1,13 @@
 import { encode } from "eventsource-encoder";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { contextOf, streamUpstream, type UpstreamEvent } from "../src/adapters/piai.js";
-import { nativeUsageFromSse, refusingFetch, SendTicket, TransportRefused } from "../src/adapters/transport.js";
+import {
+	nativeUsageFromSse,
+	refusingFetch,
+	SEND_ALREADY_ATTEMPTED,
+	SendTicket,
+	TransportRefused,
+} from "../src/adapters/transport.js";
 import type { Route } from "../src/config.js";
 import { Upstream } from "./upstream.js";
 
@@ -117,6 +123,161 @@ describe("ticket-bound transport", () => {
 		expect(up.receives.length).toBe(before + 1);
 		expect(up.redirectTargetReceives.length).toBe(0);
 		expect(ticket.used).toBe(true);
+	});
+
+	it("a 421 answered once reaches the upstream once: the dispatcher refuses the re-send the platform fetch would make (B-17)", async () => {
+		// The second scripted answer is what a re-sent request would consume.
+		up.next({ kind: "status", status: 421 }, { kind: "stream" });
+		const before = up.receives.length;
+		const ticket = new SendTicket("call_421", `${up.url}/v1`, credential, 4096);
+		const res = await ticket.fetch(`${up.url}/v1/chat/completions`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" },
+			body: '{"stream":true}',
+		});
+		expect(res.status).toBe(421);
+		await res.text();
+		await ticket.settled;
+		expect(up.receives.length).toBe(before + 1);
+		expect(up.pending).toBe(1);
+		up.next(); // leave the script as it was
+		expect(ticket.wireAttempts).toBe(1);
+		expect(ticket.response?.status).toBe(421);
+		expect(ticket.refused).toEqual([]);
+		// The unconsumed answer is taken by a fresh ticket: a new admission, a new send.
+		const later = new SendTicket("call_421b", `${up.url}/v1`, credential, 4096);
+		const ok = await later.fetch(`${up.url}/v1/chat/completions`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${credential}` },
+			body: "{}",
+		});
+		expect(ok.status).toBe(200);
+		await ok.text();
+		expect(up.pending).toBe(0);
+	});
+
+	it("a forced second dispatch on the ticket's dispatcher is refused before the wire and recorded as SEND_ALREADY_ATTEMPTED", async () => {
+		const before = up.receives.length;
+		const ticket = new SendTicket("call_twice", `${up.url}/v1`, credential, 4096);
+		const res = await ticket.fetch(`${up.url}/v1/chat/completions`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${credential}` },
+			body: "{}",
+		});
+		expect(res.status).toBe(200);
+		await res.text();
+		await ticket.settled;
+		expect(ticket.wireAttempts).toBe(1);
+		// What a retrying layer beneath the vendor client would do: dispatch again on the same dispatcher.
+		const errors: Error[] = [];
+		const accepted = ticket.dispatcher.dispatch(
+			{ origin: new URL(up.url).origin, path: "/v1/chat/completions", method: "POST", body: "{}" },
+			{
+				onResponseStart: () => {
+					throw new Error("a second dispatch must never start a response");
+				},
+				onResponseError: (_c, err) => {
+					errors.push(err);
+				},
+			},
+		);
+		expect(accepted).toBe(false);
+		expect(errors).toHaveLength(1);
+		expect(errors[0]).toBeInstanceOf(TransportRefused);
+		expect(ticket.wireAttempts).toBe(1);
+		expect(ticket.secondSendRefused).toBe(true);
+		expect(ticket.refused).toEqual([`${SEND_ALREADY_ATTEMPTED}: POST ${new URL(up.url).origin}/v1/chat/completions`]);
+		// Legacy-shaped handlers are answered too.
+		const legacy: Error[] = [];
+		ticket.dispatcher.dispatch(
+			{ origin: new URL(up.url).origin, path: "/v1/chat/completions", method: "POST", body: "{}" },
+			{ onError: (err) => legacy.push(err) },
+		);
+		expect(legacy[0]).toBeInstanceOf(TransportRefused);
+		expect(up.receives.length).toBe(before + 1);
+	});
+
+	it("a connection reset after the body and a connection closed after its answer are one receive each, never a replay", async () => {
+		up.next({ kind: "close" });
+		const before = up.receives.length;
+		const reset = new SendTicket("call_reset", `${up.url}/v1`, credential, 4096);
+		await expect(
+			reset.fetch(`${up.url}/v1/chat/completions`, {
+				method: "POST",
+				headers: { authorization: `Bearer ${credential}` },
+				body: '{"a":1}',
+			}),
+		).rejects.toThrow();
+		await reset.settled;
+		expect(up.receives.length).toBe(before + 1);
+		expect(reset.wireAttempts).toBe(1);
+		expect(reset.response).toBeUndefined();
+		expect(reset.transportError).toMatch(/socket|closed|ECONNRESET|other side/i);
+		expect(reset.request?.bodyBytes).toBe(7);
+
+		// The server answers, then closes the connection the pool would reuse:
+		// the next ticket's send is a fresh connection and a fresh admission,
+		// the closed one carries no replay.
+		up.next({ kind: "close-after-answer" }, { kind: "stream" });
+		const first = new SendTicket("call_goaway1", `${up.url}/v1`, credential, 4096);
+		const r1 = await first.fetch(`${up.url}/v1/chat/completions`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${credential}` },
+			body: "{}",
+		});
+		expect(r1.status).toBe(200);
+		await r1.text();
+		await first.settled;
+		expect(up.receives.length).toBe(before + 2);
+		const second = new SendTicket("call_goaway2", `${up.url}/v1`, credential, 4096);
+		const r2 = await second.fetch(`${up.url}/v1/chat/completions`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${credential}` },
+			body: "{}",
+		});
+		expect(r2.status).toBe(200);
+		await r2.text();
+		expect(up.receives.length).toBe(before + 3);
+		expect(up.pending).toBe(0);
+		expect(first.wireAttempts + second.wireAttempts).toBe(2);
+	});
+
+	it("the caller's signal aborts the one dispatch; nothing is dispatched for an already aborted signal", async () => {
+		const before = up.receives.length;
+		const aborted = new AbortController();
+		aborted.abort();
+		const none = new SendTicket("call_pre_abort", `${up.url}/v1`, credential, 4096);
+		await expect(
+			none.fetch(`${up.url}/v1/chat/completions`, {
+				method: "POST",
+				headers: { authorization: `Bearer ${credential}` },
+				body: "{}",
+				signal: aborted.signal,
+			}),
+		).rejects.toMatchObject({ name: "AbortError" });
+		expect(none.wireAttempts).toBe(0);
+		expect(up.receives.length).toBe(before);
+
+		up.next({ kind: "stream-then-hang", text: ["partial"] });
+		const ac = new AbortController();
+		const live = new SendTicket("call_mid_abort", `${up.url}/v1`, credential, 4096);
+		const res = await live.fetch(`${up.url}/v1/chat/completions`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${credential}` },
+			body: "{}",
+			signal: ac.signal,
+		});
+		expect(res.status).toBe(200);
+		const reader = res.body?.getReader();
+		const firstChunk = await reader?.read();
+		expect(firstChunk?.done).toBe(false);
+		ac.abort();
+		await expect(reader?.read()).rejects.toBeDefined();
+		await live.settled;
+		up.release();
+		expect(live.wireAttempts).toBe(1);
+		expect(live.response?.bodyBytes).toBeGreaterThan(0);
+		expect(up.receives.length).toBe(before + 1);
 	});
 
 	it("reads native usage and the response id from the captured body as an event stream: single-line, multiline, fragmented and multibyte inputs agree", () => {

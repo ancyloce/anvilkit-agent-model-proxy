@@ -40,6 +40,7 @@ function semantics(name: string, make: () => Promise<ObjectStore>) {
 				routeId: "r",
 				capturedAt: "2026-09-16T00:00:00Z",
 				request: { method: "POST", url: "u", contentType: "", body: "first", bodyTruncated: false },
+				wireAttempts: 1,
 				settlement: { outcome: "unknown" as const, errorCode: "UPSTREAM_ERROR", frames: [] },
 			};
 			expect(await calls.writeEvidence(evidence)).toBe(`evidence/${callId}/tenant_a`);

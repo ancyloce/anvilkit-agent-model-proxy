@@ -52,8 +52,12 @@ export class FakeControl {
 	unavailable = 0;
 	/** The next observations that are recorded but whose answer is lost. */
 	loseObserveAnswers = 0;
+	/** The next observations refused before anything is recorded, with this status (P1.3 transient-refusal scenarios). */
+	refuseObserve?: { code: number; details: string; times: number };
 	/** Admission answers to hold until release (for duplicate races). */
 	holdAdmits?: () => Promise<void>;
+	/** The next admissions refused before anything is recorded, with this status (CAPACITY_EXHAUSTED scenarios). */
+	refuseAdmit?: { code: number; details: string; times: number };
 	private server!: Server;
 	address = "";
 	private seq = 0;
@@ -114,6 +118,11 @@ export class FakeControl {
 		if (this.unavailable > 0) {
 			this.unavailable--;
 			cb({ code: status.UNAVAILABLE, details: "fake control unavailable" } as never, null);
+			return;
+		}
+		if (this.refuseAdmit && this.refuseAdmit.times > 0) {
+			this.refuseAdmit.times--;
+			cb({ code: this.refuseAdmit.code, details: this.refuseAdmit.details } as never, null);
 			return;
 		}
 		if (this.holdAdmits) await this.holdAdmits();
@@ -183,6 +192,11 @@ export class FakeControl {
 		if (this.unavailable > 0) {
 			this.unavailable--;
 			cb({ code: status.UNAVAILABLE, details: "fake control unavailable" } as never, null);
+			return;
+		}
+		if (this.refuseObserve && this.refuseObserve.times > 0) {
+			this.refuseObserve.times--;
+			cb({ code: this.refuseObserve.code, details: this.refuseObserve.details } as never, null);
 			return;
 		}
 		const r = [...this.dispatches.values()].find((d) => d.dispatchId === req.dispatchId);

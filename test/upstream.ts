@@ -27,8 +27,15 @@ export type Behavior =
 	| { kind: "status"; status: number; body?: string }
 	| { kind: "redirect"; location: string }
 	| { kind: "close" }
+	/** Answers once, then closes the connection the client would reuse (the HTTP/1.1 shape of a GOAWAY on an idle connection). */
+	| { kind: "close-after-answer" }
 	| { kind: "hang" }
-	| { kind: "stream-then-hang"; text: string[] };
+	| {
+			kind: "stream-then-hang";
+			text: string[];
+			/** Emits a usage chunk before holding: counters that arrive on a stream that never ends. */
+			usageBeforeHang?: unknown;
+	  };
 
 export class Upstream {
 	readonly receives: Receive[] = [];
@@ -44,6 +51,11 @@ export class Upstream {
 	next(...b: Behavior[]): this {
 		this.script.push(...b);
 		return this;
+	}
+
+	/** Scripted answers not yet consumed by a receive: a second wire send would have taken one. */
+	get pending(): number {
+		return this.script.length;
 	}
 
 	async start(): Promise<this> {
@@ -74,6 +86,12 @@ export class Upstream {
 
 	release(): void {
 		for (const r of this.hanging) r.end();
+		this.hanging = [];
+	}
+
+	/** Cuts every held answer's connection without ending it: the stream never completes. */
+	destroyHeld(): void {
+		for (const r of this.hanging) r.destroy();
 		this.hanging = [];
 	}
 
@@ -112,12 +130,30 @@ export class Upstream {
 				case "close":
 					res.destroy();
 					return;
+				case "close-after-answer":
+					res.writeHead(200, { "content-type": "application/json", connection: "close" }).end("{}");
+					res.on("finish", () => res.socket?.destroy());
+					return;
 				case "hang":
 					this.hanging.push(res);
 					return;
 				case "stream-then-hang":
 					res.writeHead(200, { "content-type": "text/event-stream" });
 					for (const t of b.text) res.write(this.chunk({ delta: { content: t }, finish_reason: null }));
+					if (b.usageBeforeHang !== undefined) {
+						res.write(
+							encode({
+								data: JSON.stringify({
+									id: "chatcmpl-fixture",
+									object: "chat.completion.chunk",
+									created: 1,
+									model: "fixture-model",
+									choices: [],
+									usage: b.usageBeforeHang,
+								}),
+							}),
+						);
+					}
 					this.hanging.push(res);
 					return;
 				case "stream":

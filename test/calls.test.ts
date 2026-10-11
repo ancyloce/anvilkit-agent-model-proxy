@@ -895,6 +895,9 @@ describe("controlled calls", () => {
 			// The duplicate's placeholder under the same identity and dispatch: taken over, one send.
 			placeholder = (h) => ({
 				...h,
+				// The duplicate instance's own creator stamp (P1.3, MP-10).
+				createdBy: "model-proxy/d",
+				createNonce: "dup-1",
 				state: "unknown",
 				errorCode: "PERMISSION_LOST",
 				frames: [{ callId: h.callId, sequence: "0", type: "admitted" }],
@@ -914,6 +917,8 @@ describe("controlled calls", () => {
 			created = [];
 			placeholder = (h) => ({
 				...h,
+				createdBy: "model-proxy/d",
+				createNonce: "dup-2",
 				dispatchId: "dsp_someone_elses",
 				state: "unknown",
 				errorCode: "PERMISSION_LOST",
@@ -936,6 +941,8 @@ describe("controlled calls", () => {
 			// A record of another caller under the scope: refused as a reentry is, never replaced, nothing sent.
 			placeholder = (h) => ({
 				...h,
+				createdBy: "model-proxy/d",
+				createNonce: "dup-3",
 				principalId: "anvilkit-job-access-sidecar",
 				state: "unknown",
 				errorCode: "PERMISSION_LOST",
@@ -1193,6 +1200,7 @@ describe("two Proxy instances on one store", () => {
 				body: "{}",
 				bodyTruncated: false,
 			},
+			wireAttempts: 1,
 			response: { status: 200, headers: {}, bodyBase64: "", bodyBytes: 0, bodyTruncated: false },
 			settlement: { outcome: "succeeded", usage, nativeReference: "chatcmpl-settled", frames },
 		});
@@ -1313,6 +1321,7 @@ describe("two Proxy instances on one store", () => {
 				body: "{}",
 				bodyTruncated: false,
 			},
+			wireAttempts: 1,
 			response: { status: 200, headers: {}, bodyBase64: "", bodyBytes: 0, bodyTruncated: false },
 			settlement: { outcome: "succeeded", usage, nativeReference: "chatcmpl-late", frames },
 		});
@@ -1381,6 +1390,7 @@ describe("two Proxy instances on one store", () => {
 				body: "{}",
 				bodyTruncated: false,
 			},
+			wireAttempts: 1,
 			transportError: "socket hang up",
 			settlement: {
 				outcome: "unknown",
@@ -1419,6 +1429,7 @@ describe("two Proxy instances on one store", () => {
 			routeId: "controlled-openai-v1",
 			capturedAt: new Date().toISOString(),
 			request: { method: "POST", url: "u", contentType: "", body: "{}", bodyTruncated: false },
+			wireAttempts: 1,
 			settlement: {
 				outcome: "succeeded",
 				usage: { inputUnits: "1", outputUnits: "1", reasoningUnits: "0", cachedInputUnits: "0" },
@@ -1540,6 +1551,8 @@ describe("two Proxy instances on one store", () => {
 						armed = false;
 						const placeholder = {
 							...holder,
+							createdBy: "model-proxy/d",
+							createNonce: "dup-lost",
 							state: "unknown",
 							errorCode: "PERMISSION_LOST",
 							revision: 2,
