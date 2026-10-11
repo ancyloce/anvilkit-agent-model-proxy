@@ -84,6 +84,14 @@ export interface CallRecord {
 	observations: Observation[];
 	cancelRequestedAt?: string;
 	/**
+	 * The creator's stamp (P1.3, MP-10): the instance that created the
+	 * record and the nonce of that one create attempt. A conditional create
+	 * whose success answer was lost and that the SDK repeated is recognised
+	 * by the holder as its own write, not as another instance's record.
+	 */
+	createdBy?: string;
+	createNonce?: string;
+	/**
 	 * When a sweep reclaimed the send as unknown (SENDER_LOST) without
 	 * evidence: the pending marker stays for the late-settlement window
 	 * after this instant so the sender's evidence, landing late, is still
