@@ -1,5 +1,5 @@
 // The guarded transport (DD-02 §4 step 5, DD-03 §6): the only outbound HTTP
-// path of the process. pi-ai 0.85.1 takes the fetch implementation of a
+// path of the process. pi-ai 1.1.0 takes the fetch implementation of a
 // call as a request option (ProviderRequestOptions.fetch, handed to the
 // vendor client it builds per call), so every send is made through the
 // fetch of one SendTicket — the consumed single-use permission of one call.
@@ -295,9 +295,11 @@ export class SendTicket {
 		let stream: ReadableStreamDefaultController<Uint8Array> | undefined;
 		let started = false;
 		let finished = false;
+		let drainTimer: ReturnType<typeof setTimeout> | undefined;
 		const finish = (err?: unknown) => {
 			if (finished) return;
 			finished = true;
+			clearTimeout(drainTimer);
 			const out = new Uint8Array(kept);
 			let off = 0;
 			for (const c of chunks) {
@@ -340,6 +342,15 @@ export class SendTicket {
 							stream = c;
 						},
 						cancel: (reason) => {
+							// OpenAI 7 stops iterating at [DONE], which cancels its
+							// reader before HTTP EOF. Keep capturing that same response
+							// briefly; only real EOF establishes complete usage. An
+							// explicit abort still stops the wire immediately, and a
+							// peer that never closes remains unknown after this bound.
+							if (this.usage.hasCompletionSentinel && !signal?.aborted && !finished) {
+								drainTimer = setTimeout(() => controller.abort(new Error("response EOF timeout")), 1000);
+								return;
+							}
 							controller.abort(reason instanceof Error ? reason : abortError());
 						},
 					});
@@ -469,14 +480,20 @@ export function refuseGlobalFetch(): void {
  * completed, never what it hints at.
  */
 export class StreamingUsage {
+	hasCompletionSentinel = false;
 	private usage: unknown;
 	private found = false;
 	private responseId?: string;
 	private readonly decoder = new TextDecoder();
 	private readonly parser = createParser({
 		onEvent: (event) => {
+			if (this.hasCompletionSentinel) return;
 			const payload = event.data.trim();
-			if (!payload || payload === "[DONE]") return;
+			if (payload === "[DONE]") {
+				this.hasCompletionSentinel = true;
+				return;
+			}
+			if (!payload) return;
 			let chunk: unknown;
 			try {
 				chunk = JSON.parse(payload);

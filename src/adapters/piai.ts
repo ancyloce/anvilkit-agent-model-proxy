@@ -1,7 +1,7 @@
 // The pi-ai adapter (B05, DD-03 §2 ControlledModelPort): protocol
 // adaptation of one call on one route through the pinned SDK's
 // openai-completions path — the only API path this build implements and
-// inspected (pi-ai 0.85.1 api/openai-completions.js: one OpenAI client per
+// inspected (pi-ai 1.1.0 api/openai-completions.js: one OpenAI client per
 // call built on the fetch the request option names; the SDK is called with
 // maxRetries 0 and pi's own retry wrapper retries nothing at maxRetries 0;
 // no fallback of its own). The model definition is built here from the
@@ -10,7 +10,15 @@
 // every request option that could add headers, sessions, caching or
 // retries is fixed. Thinking content is not part of the frozen frame
 // contract and is left to the native evidence.
-import type { AssistantMessage, Context, Model, Message as PiMessage, Tool, ToolCall } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	type Context,
+	type Model,
+	normalizeContext,
+	type Message as PiMessage,
+	type Tool,
+	type ToolCall,
+} from "@earendil-works/pi-ai";
 import { stream as streamOpenAICompletions } from "@earendil-works/pi-ai/api/openai-completions";
 import type { Route, ToolSchema } from "../config.js";
 import { type Message, parseStrictJson, type ToolDefinition } from "../contracts.js";
@@ -35,13 +43,17 @@ export interface UpstreamInput {
 
 /** The pi-ai model of a route: explicit compatibility, no URL-based detection, no cost (Control meters). */
 export function modelOf(route: Route): Model<"openai-completions"> {
+	// DeepSeek defaults to thinking. The relay carries text and tool calls,
+	// not provider reasoning history, so explicitly request non-thinking on
+	// every turn through the SDK's reviewed DeepSeek compatibility branch.
+	const deepseek = route.provider === "deepseek";
 	return {
 		id: route.model,
 		name: route.model,
 		api: "openai-completions",
 		provider: route.provider,
 		baseUrl: route.baseUrl,
-		reasoning: false,
+		reasoning: deepseek,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 1_000_000,
@@ -57,7 +69,7 @@ export function modelOf(route: Route): Model<"openai-completions"> {
 			requiresAssistantAfterToolResult: false,
 			requiresThinkingAsText: false,
 			requiresReasoningContentOnAssistantMessages: false,
-			thinkingFormat: "openai",
+			thinkingFormat: deepseek ? "deepseek" : "openai",
 			zaiToolStream: false,
 			supportsThinkingTokenBudget: false,
 			supportsStrictMode: false,
@@ -117,7 +129,7 @@ export function contextOf(route: Route, messages: Message[], tools: ToolSchema[]
 						type: "toolCall",
 						id: tc.toolCallId,
 						name: tc.name,
-						arguments: parseStrictJson(tc.arguments) as Record<string, unknown>,
+						arguments: parseStrictJson(tc.arguments) as ToolCall["arguments"],
 					};
 					content.push(call);
 				}
@@ -164,7 +176,7 @@ export async function* streamUpstream(input: UpstreamInput): AsyncGenerator<Upst
 	});
 	const model = modelOf(input.route);
 	const context = contextOf(input.route, input.messages, tools);
-	const stream = streamOpenAICompletions(model, context, {
+	const stream = streamOpenAICompletions(model, normalizeContext(context), {
 		apiKey: input.credential,
 		fetch: input.ticket.fetch,
 		// The wire carries the service's name, not the host's platform details.
@@ -189,6 +201,18 @@ export async function* streamUpstream(input: UpstreamInput): AsyncGenerator<Upst
 				};
 				break;
 			case "done":
+				// The relay has no partial/deferred success state. A token limit
+				// must not become a successful coding turn (or execute a partial
+				// tool call). Native evidence and metering still retain its usage.
+				if (ev.reason !== "stop" && ev.reason !== "toolUse") {
+					yield {
+						type: "error",
+						reason: "error",
+						message: `UPSTREAM_FINISH_${ev.reason.toUpperCase()}`,
+						final: ev.message,
+					};
+					return;
+				}
 				yield { type: "done", reason: ev.reason, message: ev.message };
 				return;
 			case "error":
