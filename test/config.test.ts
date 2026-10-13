@@ -87,6 +87,33 @@ describe("configuration", () => {
 		expect(() => configFrom(twice)).toThrow(/declared twice/);
 	});
 
+	it("P2.3: refuses a plaintext route to a non-loopback host and an unknown health probe", () => {
+		expect(() =>
+			configFrom(base.replace("base_url: http://127.0.0.1:1/v1", "base_url: http://api.provider.example/v1")),
+		).toThrow(/base_url must be https for the non-loopback host api.provider.example/);
+		expect(() =>
+			configFrom(base.replace("base_url: http://127.0.0.1:1/v1", "base_url: http://10.0.0.7:8080/v1")),
+		).toThrow(/must be https/);
+		expect(() =>
+			configFrom(base.replace("base_url: http://127.0.0.1:1/v1", "base_url: http://localhost:1/v1")),
+		).not.toThrow();
+		expect(() =>
+			configFrom(base.replace("base_url: http://127.0.0.1:1/v1", "base_url: http://[::1]:1/v1")),
+		).not.toThrow();
+		const https = configFrom(
+			base.replace(
+				"base_url: http://127.0.0.1:1/v1",
+				"base_url: https://api.provider.example/v1\n    health_probe: models",
+			),
+		);
+		expect(https.routes[0]?.healthProbe).toBe("models");
+		expect(() =>
+			configFrom(
+				base.replace("base_url: http://127.0.0.1:1/v1", "base_url: http://127.0.0.1:1/v1\n    health_probe: chat"),
+			),
+		).toThrow(/health_probe must be none or models/);
+	});
+
 	it("requires the development inputs once the profile is enabled and validates ranges", () => {
 		expect(() => configFrom(base.replace("mode: disabled", "mode: development"))).toThrow(ConfigError);
 		expect(() => configFrom(base.replace("mode: disabled", "mode: development"), devEnv)).not.toThrow();

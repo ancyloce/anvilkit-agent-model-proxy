@@ -22,6 +22,7 @@ function route(baseUrl: string): Route {
 		model: "fixture-model",
 		baseUrl,
 		credentialEnv: "ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1",
+		healthProbe: "none",
 		limits: {
 			maxOutputTokens: 4096,
 			maxExposure: { currency: "USD", amount: "1000000" },
@@ -55,6 +56,27 @@ describe("ticket-bound transport", () => {
 	});
 	afterAll(async () => {
 		await up.stop();
+	});
+
+	it("an explicit abort still closes the wire after the completion sentinel", async () => {
+		up.next({ kind: "stream", hangAfterDone: true });
+		const controller = new AbortController();
+		const ticket = new SendTicket("abort-after-done", up.url, credential, 4096);
+		const res = await ticket.fetch(`${up.url}/chat/completions`, {
+			method: "POST",
+			headers: { authorization: `Bearer ${credential}` },
+			body: "{}",
+			signal: controller.signal,
+		});
+		const reader = res.body?.getReader();
+		expect(reader).toBeDefined();
+		while (!ticket.usage.hasCompletionSentinel) await reader?.read();
+		await reader?.cancel();
+		controller.abort();
+		await ticket.settled;
+		expect(ticket.streamComplete).toBe(false);
+		expect(ticket.transportError).toBeDefined();
+		expect(ticket.wireAttempts).toBe(1);
 	});
 
 	it("the process-wide fetch of the bootstrap refuses every request and counts nothing upstream", async () => {
@@ -438,6 +460,91 @@ describe("pi-ai openai-completions path on the ticket's fetch", () => {
 			content: "The brief says: one hero, one call to action.",
 		});
 	});
+
+	it("DeepSeek sends explicit non-thinking turns at the root endpoint, with tools and native usage on the finish chunk", async () => {
+		const deepseekRoute = { ...route(up.url), provider: "deepseek", model: "account-selected-model" };
+		const usage = {
+			prompt_tokens: 12,
+			completion_tokens: 5,
+			total_tokens: 17,
+			prompt_cache_hit_tokens: 4,
+			prompt_cache_miss_tokens: 8,
+		};
+		const before = up.receives.length;
+		up.next({
+			kind: "stream",
+			toolCall: { id: "ds_tool", name: "read_brief", arguments: '{"section":"hero"}' },
+			usage,
+			usageOnFinish: true,
+			fragmentBytes: 7,
+		});
+		const first = new SendTicket("ds_first", up.url, credential, 1 << 20);
+		const events = await collect(streamUpstream(input(first, { route: deepseekRoute })));
+		expect(events.at(-1)).toMatchObject({ type: "done", reason: "toolUse" });
+		await first.settled;
+		expect(nativeUsageFromSse(first.response?.body ?? new Uint8Array())?.usage).toEqual(usage);
+		up.next({ kind: "stream", text: ["Done."], usage, usageOnFinish: true });
+		const second = new SendTicket("ds_second", up.url, credential, 1 << 20);
+		const next = await collect(
+			streamUpstream(
+				input(second, {
+					route: deepseekRoute,
+					messages: [
+						{ role: "user", content: "Read the brief." },
+						{
+							role: "assistant",
+							content: "",
+							toolCalls: [{ toolCallId: "ds_tool", name: "read_brief", arguments: '{"section":"hero"}' }],
+						},
+						{ role: "tool", toolCallId: "ds_tool", content: "A synthetic hero." },
+					],
+				}),
+			),
+		);
+		expect(next.at(-1)).toMatchObject({ type: "done", reason: "stop" });
+		const receives = up.receives.slice(before);
+		expect(receives).toHaveLength(2);
+		for (const r of receives) {
+			expect(r.url).toBe("/chat/completions");
+			const body = JSON.parse(r.body);
+			expect(body).toMatchObject({
+				model: "account-selected-model",
+				thinking: { type: "disabled" },
+				max_tokens: 256,
+				stream: true,
+				stream_options: { include_usage: true },
+			});
+			expect(body.reasoning_effort).toBeUndefined();
+			expect(body.tools[0].function.strict).toBeUndefined();
+			expect(r.headers.authorization).toBe(`Bearer ${credential}`);
+		}
+		expect(JSON.parse(receives[1]?.body ?? "{}").messages.at(-1)).toMatchObject({
+			role: "tool",
+			tool_call_id: "ds_tool",
+		});
+		expect(first.refused).toEqual([]);
+		expect(second.refused).toEqual([]);
+	});
+
+	it.each(["length", "content_filter", "insufficient_system_resource", "aborted"])(
+		"DeepSeek finish %s is an error with native usage retained and no retry",
+		async (finish) => {
+			const before = up.receives.length;
+			up.next({ kind: "stream", text: ["Partial"], finish, usageOnFinish: true });
+			const ticket = new SendTicket(`ds_${finish}`, up.url, credential, 1 << 20);
+			const events = await collect(
+				streamUpstream(input(ticket, { route: { ...route(up.url), provider: "deepseek" } })),
+			);
+			expect(events.at(-1)?.type).toBe("error");
+			expect(up.receives.length).toBe(before + 1);
+			await ticket.settled;
+			expect(nativeUsageFromSse(ticket.response?.body ?? new Uint8Array())?.usage).toMatchObject({
+				prompt_tokens: 12,
+				completion_tokens: 5,
+			});
+			expect(ticket.refused).toEqual([]);
+		},
+	);
 
 	it("the context keeps assistant text beside tool calls and names tool results by the call they answer", () => {
 		const ctx = contextOf(

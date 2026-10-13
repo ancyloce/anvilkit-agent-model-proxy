@@ -19,10 +19,16 @@ export type Behavior =
 			toolCall?: { id: string; name: string; arguments: string };
 			/** The usage member of the final chunk as the double reports it (any value); null: no usage chunk. */
 			usage?: unknown;
+			/** DeepSeek reports usage on the finish chunk instead of a separate usage-only chunk. */
+			usageOnFinish?: boolean;
 			finish?: string;
 			id?: string;
 			/** Writes the whole answer in fragments of this many bytes (cutting events, lines and multibyte sequences). */
 			fragmentBytes?: number;
+			/** Delays HTTP EOF after [DONE], exercising SDK reader cancellation. */
+			endDelayMs?: number;
+			/** Leaves HTTP open after [DONE], until release or the ticket's drain bound. */
+			hangAfterDone?: boolean;
 	  }
 	| { kind: "status"; status: number; body?: string }
 	| { kind: "redirect"; location: string }
@@ -203,7 +209,8 @@ export class Upstream {
 				id,
 			);
 		}
-		out += this.chunk({ delta: {}, finish_reason: b.finish ?? (b.toolCall ? "tool_calls" : "stop") }, {}, id);
+		const finish = { delta: {}, finish_reason: b.finish ?? (b.toolCall ? "tool_calls" : "stop") };
+		if (!b.usageOnFinish) out += this.chunk(finish, {}, id);
 		if (b.usage !== null) {
 			const usage = b.usage ?? {
 				prompt_tokens: 12,
@@ -212,18 +219,25 @@ export class Upstream {
 				prompt_tokens_details: { cached_tokens: 0 },
 				completion_tokens_details: { reasoning_tokens: 0 },
 			};
-			out += encode({
-				data: JSON.stringify({
-					id,
-					object: "chat.completion.chunk",
-					created: 1,
-					model: "fixture-model",
-					choices: [],
-					usage,
-				}),
-			});
+			out += b.usageOnFinish
+				? this.chunk(finish, { usage }, id)
+				: encode({
+						data: JSON.stringify({
+							id,
+							object: "chat.completion.chunk",
+							created: 1,
+							model: "fixture-model",
+							choices: [],
+							usage,
+						}),
+					});
 		}
 		out += encode({ data: "[DONE]" });
+		const end = () => {
+			if (b.hangAfterDone) this.hanging.push(res);
+			else if (b.endDelayMs) setTimeout(() => res.end(), b.endDelayMs);
+			else res.end();
+		};
 		if (b.fragmentBytes) {
 			// The bytes leave in pieces that cut lines and multibyte sequences:
 			// what a network delivers, and what the parser must reassemble.
@@ -231,7 +245,7 @@ export class Upstream {
 			let i = 0;
 			const next = () => {
 				if (i >= bytes.length) {
-					res.end();
+					end();
 					return;
 				}
 				res.write(bytes.subarray(i, i + (b.fragmentBytes as number)));
@@ -242,6 +256,6 @@ export class Upstream {
 			return;
 		}
 		res.write(out);
-		res.end();
+		end();
 	}
 }

@@ -427,6 +427,74 @@ describe("controlled calls", () => {
 		}
 	});
 
+	it("a token-limited reply fails without losing metering or resending on reentry", async () => {
+		const before = up.receives.length;
+		up.next({ kind: "stream", text: ["Partial"], finish: "length", usageOnFinish: true });
+		const callId = id("token-limited");
+		const body = requestBody(callId);
+		const first = await call(proxy.url, "POST", "/api/v1/model-calls", body);
+		expect(first.frames.at(-1)).toMatchObject({
+			type: "error",
+			outcome: "failed",
+			errorCode: "UPSTREAM_ERROR",
+			usage: { inputUnits: "12", outputUnits: "5" },
+		});
+		const replay = await call(proxy.url, "POST", "/api/v1/model-calls", body);
+		expect(replay.frames).toEqual(first.frames);
+		expect(up.receives.length).toBe(before + 1);
+		expect(control.byCall(callId)?.observations).toHaveLength(1);
+		expect(control.byCall(callId)?.observations[0]?.usage).toMatchObject({ input: "12", output: "5" });
+	});
+
+	it("a completion sentinel without HTTP EOF stays unknown after the bounded drain and never resends", async () => {
+		const before = up.receives.length;
+		up.next({ kind: "stream", text: ["Done?"], hangAfterDone: true });
+		const callId = id("done-without-eof");
+		const body = requestBody(callId);
+		const started = Date.now();
+		const first = await call(proxy.url, "POST", "/api/v1/model-calls", body);
+		expect(first.frames.at(-1)).toMatchObject({
+			type: "error",
+			outcome: "unknown",
+			errorCode: "USAGE_INCOMPLETE",
+		});
+		expect(first.frames.at(-1)?.usage).toBeUndefined();
+		expect(Date.now() - started).toBeLessThan(5000);
+		expect(control.byCall(callId)?.observations[0]?.usage).toBeUndefined();
+		const replay = await call(proxy.url, "POST", "/api/v1/model-calls", body);
+		expect(replay.frames).toEqual(first.frames);
+		expect(up.receives.length).toBe(before + 1);
+	});
+
+	it("DeepSeek cache hits reach the frames and Control as inclusive native counters", async () => {
+		up.next({
+			kind: "stream",
+			usageOnFinish: true,
+			usage: {
+				prompt_tokens: 12,
+				completion_tokens: 5,
+				total_tokens: 17,
+				prompt_cache_hit_tokens: 4,
+				prompt_cache_miss_tokens: 8,
+			},
+		});
+		const callId = id("deepseek-cache");
+		const reply = await call(proxy.url, "POST", "/api/v1/model-calls", requestBody(callId));
+		expect(reply.frames.at(-1)).toMatchObject({
+			type: "done",
+			usage: {
+				inputUnits: "12",
+				outputUnits: "5",
+				cachedInputUnits: "4",
+			},
+		});
+		expect(control.byCall(callId)?.observations[0]?.usage).toMatchObject({
+			input: "12",
+			output: "5",
+			cached: "4",
+		});
+	});
+
 	it("missing usage stays distinct from explicit zero usage", async () => {
 		up.next({ kind: "stream", text: ["no usage chunk"], usage: null });
 		const missing = id("missing-usage");
@@ -487,6 +555,22 @@ describe("controlled calls", () => {
 			],
 			["a detail that is not an object", { prompt_tokens: 3, completion_tokens: 2, prompt_tokens_details: 7 }],
 			["a usage that is an array", [3, 2]],
+			["DeepSeek hits above prompt", { prompt_tokens: 3, completion_tokens: 2, prompt_cache_hit_tokens: 4 }],
+			["DeepSeek fractional hits", { prompt_tokens: 3, completion_tokens: 2, prompt_cache_hit_tokens: 0.5 }],
+			["DeepSeek missing hit partition", { prompt_tokens: 3, completion_tokens: 2, prompt_cache_miss_tokens: 3 }],
+			[
+				"DeepSeek inconsistent partition",
+				{ prompt_tokens: 3, completion_tokens: 2, prompt_cache_hit_tokens: 1, prompt_cache_miss_tokens: 3 },
+			],
+			[
+				"conflicting cache counters",
+				{
+					prompt_tokens: 3,
+					completion_tokens: 2,
+					prompt_cache_hit_tokens: 1,
+					prompt_tokens_details: { cached_tokens: 0 },
+				},
+			],
 		] as const) {
 			up.next({ kind: "stream", text: ["counted?"], usage });
 			const callId = id("invalid-usage");
@@ -638,7 +722,7 @@ describe("controlled calls", () => {
 			// 300 four-byte characters (1200 bytes) arrive in fragments that cut
 			// multibyte sequences; the frames carry them whole, within the bound.
 			const text = "🎉".repeat(300);
-			up.next({ kind: "stream", text: [text], fragmentBytes: 7 });
+			up.next({ kind: "stream", text: [text], fragmentBytes: 7, endDelayMs: 100 });
 			const callId = id("frame-bytes");
 			const r = await call(framed.url, "POST", "/api/v1/model-calls", requestBody(callId));
 			expect(r.status, r.text).toBe(200);
@@ -647,7 +731,7 @@ describe("controlled calls", () => {
 			for (const f of r.frames) expect(encodedFrameBytes(f)).toBeLessThanOrEqual(1024);
 			expect(texts.map((f) => f.text).join("")).toBe(text);
 			for (const f of texts) expect((f.text ?? "").length % 2, "no broken surrogate pair").toBe(0);
-			expect(r.frames.at(-1)).toMatchObject({ type: "done", outcome: "succeeded" });
+			expect(r.frames.at(-1), JSON.stringify(r.frames.at(-1))).toMatchObject({ type: "done", outcome: "succeeded" });
 			const rec = await framed.store.read(scope(callId));
 			expect(rec?.record.frames).toEqual(r.frames);
 			// Six frames at most: admitted, four content frames, the final one. Content
