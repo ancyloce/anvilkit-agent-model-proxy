@@ -344,6 +344,8 @@ function counter(v: unknown): number | undefined {
  * unknown with the exposure retained, never zero cost. The counters are
  * reported inclusive as the protocol states them; Control's price book
  * interprets inclusion (DD-02 §3).
+ * DeepSeek reports prompt_cache_hit_tokens/prompt_cache_miss_tokens instead:
+ * validate their partition and reject conflicting cache counts, never guess.
  */
 export function usageFromOpenAI(raw: unknown): NativeUsageReport {
 	if (!isObject(raw)) return { kind: "invalid", reason: "usage is not an object" };
@@ -357,7 +359,7 @@ export function usageFromOpenAI(raw: unknown): NativeUsageReport {
 			return { kind: "invalid", reason: "total_tokens is not the sum of prompt_tokens and completion_tokens" };
 		}
 	}
-	let cached = 0;
+	let cached: number | undefined;
 	if (raw.prompt_tokens_details !== undefined && raw.prompt_tokens_details !== null) {
 		if (!isObject(raw.prompt_tokens_details))
 			return { kind: "invalid", reason: "prompt_tokens_details is not an object" };
@@ -371,6 +373,19 @@ export function usageFromOpenAI(raw: unknown): NativeUsageReport {
 				};
 			}
 			cached = n;
+		}
+	}
+	if (raw.prompt_cache_hit_tokens !== undefined) {
+		const hits = counter(raw.prompt_cache_hit_tokens);
+		if (hits === undefined || hits > prompt || (cached !== undefined && cached !== hits)) {
+			return { kind: "invalid", reason: "prompt_cache_hit_tokens is invalid or conflicts with cached_tokens" };
+		}
+		cached = hits;
+	}
+	if (raw.prompt_cache_miss_tokens !== undefined) {
+		const misses = counter(raw.prompt_cache_miss_tokens);
+		if (misses === undefined || cached === undefined || misses !== prompt - cached) {
+			return { kind: "invalid", reason: "prompt cache hit and miss counters do not partition prompt_tokens" };
 		}
 	}
 	let reasoning = 0;
@@ -396,7 +411,7 @@ export function usageFromOpenAI(raw: unknown): NativeUsageReport {
 			inputUnits: String(prompt),
 			outputUnits: String(completion),
 			reasoningUnits: String(reasoning),
-			cachedInputUnits: String(cached),
+			cachedInputUnits: String(cached ?? 0),
 		},
 	};
 }
