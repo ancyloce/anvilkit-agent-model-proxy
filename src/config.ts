@@ -52,6 +52,8 @@ export interface Route {
 	credentialEnv: string;
 	limits: RouteLimits;
 	tools: ToolSchema[];
+	/** P2.3: the unpaid health probe of the route (GET <base_url>/models), or none. */
+	healthProbe: "none" | "models";
 }
 
 /**
@@ -586,7 +588,18 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 				errors.push(`${prefix} must be a mapping`);
 				return;
 			}
-			const known = ["id", "enabled", "api", "provider", "model", "base_url", "credential_env", "limits", "tools"];
+			const known = [
+				"id",
+				"enabled",
+				"api",
+				"provider",
+				"model",
+				"base_url",
+				"credential_env",
+				"limits",
+				"tools",
+				"health_probe",
+			];
 			for (const k of Object.keys(r)) {
 				if (!known.includes(k)) errors.push(`${prefix}: unknown key ${k}`);
 			}
@@ -611,9 +624,17 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 				if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("scheme");
 				if (u.username || u.password || u.hash) throw new Error("credentials or fragment");
 				origin = u.origin;
+				// P2.3: a provider key never travels in the clear: plaintext
+				// http is admitted only to a loopback host (the countable
+				// controlled upstream of the scenarios).
+				if (u.protocol === "http:" && !isLoopbackHost(u.hostname))
+					errors.push(`${prefix}.base_url must be https for the non-loopback host ${u.hostname}`);
 			} catch {
 				errors.push(`${prefix}.base_url must be an absolute http(s) URL without credentials`);
 			}
+			const healthProbe = String(r.health_probe ?? "none");
+			if (healthProbe !== "none" && healthProbe !== "models")
+				errors.push(`${prefix}.health_probe must be none or models (an unpaid GET of <base_url>/models)`);
 			const credentialEnv = String(r.credential_env ?? "");
 			if (!credentialEnvPattern.test(credentialEnv)) {
 				errors.push(`${prefix}.credential_env must match ANVILKIT_MODEL_PROXY_CREDENTIAL_<NAME>`);
@@ -692,6 +713,7 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 					credentialEnv,
 					limits,
 					tools,
+					healthProbe: healthProbe === "models" ? "models" : "none",
 				});
 			}
 		});
@@ -800,6 +822,12 @@ export function disabled(cfg: Config): boolean {
  * declare a route whose deployment inputs are incomplete; such a route is
  * denied, never approximated.
  */
+/** Loopback hosts: 127.0.0.0/8, ::1 and localhost. */
+export function isLoopbackHost(hostname: string): boolean {
+	const h = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+	return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
+}
+
 export function routeDisabledReasons(cfg: Config, route: Route): string[] {
 	const reasons: string[] = [];
 	if (!route.enabled) reasons.push("enabled: false");

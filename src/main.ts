@@ -8,6 +8,7 @@
 import { randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 import { ControlClient } from "./adapters/control.js";
+import { RouteHealth } from "./adapters/probe.js";
 import { CallStore, newObjectStore } from "./adapters/store.js";
 import { refuseGlobalFetch } from "./adapters/transport.js";
 import { CallService } from "./application/calls.js";
@@ -67,7 +68,14 @@ export async function run(cfg: Config): Promise<void> {
 		sameFiles ? identityWatcher : undefined,
 	);
 	const instanceId = `${hostname().slice(0, 24)}-${randomBytes(4).toString("hex")}`;
-	const calls = new CallService({ cfg, contract, control, store, log, instanceId });
+	// P2.3: the unpaid health probe of every served route that declares one.
+	const routeHealth = new RouteHealth(
+		cfg,
+		cfg.routes.filter((r) => r.healthProbe === "models" && routeDisabledReasons(cfg, r).length === 0),
+		log,
+	);
+	await routeHealth.start();
+	const calls = new CallService({ cfg, contract, control, store, log, instanceId, health: routeHealth });
 	const identity: Identity =
 		cfg.identity.mode === "mtls"
 			? new MtlsIdentity(cfg.identity.mtls.principals)
@@ -155,6 +163,7 @@ export async function run(cfg: Config): Promise<void> {
 	health.close();
 	control.close();
 	identityWatcher?.stop();
+	routeHealth.stop();
 	await telemetry.shutdown().catch((err) => log.warn("span flush failed", { error: String(err) }));
 }
 
