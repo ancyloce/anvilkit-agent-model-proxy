@@ -100,6 +100,8 @@ export interface CallDeps {
 	now?: () => number;
 	/** Polling interval of cancellation intents and of a send owned by another instance. */
 	pollMs?: number;
+	/** P2.3: the latest unpaid health probe per route; a failing route refuses new calls. */
+	health?: { healthy(routeId: string): boolean };
 }
 
 /** An in-flight send owned by this process. */
@@ -174,6 +176,12 @@ export class CallService {
 	/** Validates a new call against the route profile; returns the route and the deadline. */
 	private validate(req: ModelCallRequest): { route: Route; deadlineMs: number } {
 		const route = this.route(req.routeId);
+		if (this.d.health && !this.d.health.healthy(route.id))
+			throw new CallError(
+				"DEPENDENCY_UNAVAILABLE",
+				`route ${route.id} failed its latest health probe; no send was attempted`,
+				true,
+			);
 		const nowMs = this.now();
 		const deadlineMs = Date.parse(req.deadline);
 		if (Number.isNaN(deadlineMs)) throw new CallError("INVALID_ARGUMENT", "deadline is not a timestamp");
