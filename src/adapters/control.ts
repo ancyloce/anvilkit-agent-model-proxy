@@ -24,6 +24,7 @@ import {
 import type { Config } from "../config.js";
 import type { ExecutionBinding, Outcome, Usage } from "../contracts.js";
 import { clientCredentials, clientOptions, IdentityWatcher } from "../identity.js";
+import { currentTraceparent } from "../telemetry.js";
 
 /** Control refused the request on a precondition; code is the public error code. */
 export class ControlRefused extends Error {
@@ -239,7 +240,11 @@ export class ControlClient implements DispatchPort {
 		phase: Phase,
 	): Promise<Res> {
 		return new Promise<Res>((resolve, reject) => {
-			fn.call(this.client, req, new Metadata(), { deadline: new Date(Date.now() + this.timeoutMs) }, (err, res) => {
+			// P3.6: Control's spans join the request's trace (W3C traceparent).
+			const md = new Metadata();
+			const traceparent = currentTraceparent();
+			if (traceparent) md.set("traceparent", traceparent);
+			fn.call(this.client, req, md, { deadline: new Date(Date.now() + this.timeoutMs) }, (err, res) => {
 				if (err) reject(refusal(err, phase));
 				else resolve(res);
 			});

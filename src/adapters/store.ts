@@ -12,7 +12,7 @@
 // delete (MinIO ignores If-Match on DeleteObject), so nothing whose loss
 // would hide evidence is ever protected by a delete alone: a reclaimed
 // send keeps a `reclaimed` index entry until its evidence is taken.
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -116,20 +116,59 @@ export class FilesystemStore implements ObjectStore {
 			}
 			return versionOf(body);
 		}
-		if (opts.ifMatch !== undefined) {
-			const current = await this.get(key);
-			if (!current || current.version !== opts.ifMatch) throw new PreconditionFailed(`${key} changed`);
+		// P3.5: the version check and the replacement are one step under the
+		// key's lock, across instances and processes sharing the directory;
+		// without it two writers both passed the check at one version and both
+		// published (the IT-MODEL-PROXY two-observation intermittent).
+		return await this.locked(target, async () => {
+			if (opts.ifMatch !== undefined) {
+				const current = await this.get(key);
+				if (!current || current.version !== opts.ifMatch) throw new PreconditionFailed(`${key} changed`);
+			}
+			// Unique per write: two writes of one process in one millisecond (a
+			// sender's settlement and the sweep's reclaim) must not collide.
+			const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+			const fh = await open(tmp, "wx", 0o640);
+			try {
+				await fh.writeFile(body);
+				await fh.sync();
+			} finally {
+				await fh.close();
+			}
+			await rename(tmp, target);
+			return versionOf(body);
+		});
+	}
+
+	/**
+	 * Runs fn holding the key's lock: a lock file created exclusively (O_EXCL),
+	 * which holds across processes on one host. A lock older than 30 s belongs
+	 * to a writer that died and is broken; a lock not taken within 10 s fails
+	 * the write (the caller's conditional logic retries).
+	 */
+	private async locked<T>(target: string, fn: () => Promise<T>): Promise<T> {
+		const lock = `${target}.lock`;
+		const deadline = Date.now() + 10_000;
+		for (;;) {
+			try {
+				await (await open(lock, "wx", 0o640)).close();
+				break;
+			} catch (err) {
+				if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+				const held = await stat(lock).catch(() => undefined);
+				if (held && Date.now() - held.mtimeMs > 30_000) {
+					await rm(lock, { force: true });
+					continue;
+				}
+				if (Date.now() > deadline) throw new Error(`${target}: the store lock was not acquired within 10 s`);
+				await new Promise((r) => setTimeout(r, 2 + Math.random() * 10));
+			}
 		}
-		const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
-		const fh = await open(tmp, "wx", 0o640);
 		try {
-			await fh.writeFile(body);
-			await fh.sync();
+			return await fn();
 		} finally {
-			await fh.close();
+			await rm(lock, { force: true });
 		}
-		await rename(tmp, target);
-		return versionOf(body);
 	}
 
 	async delete(key: string): Promise<void> {
@@ -143,7 +182,7 @@ export class FilesystemStore implements ObjectStore {
 			const entries = await readdir(dir, { recursive: true, withFileTypes: true });
 			const out: string[] = [];
 			for (const e of entries) {
-				if (!e.isFile() || e.name.endsWith(".tmp")) continue;
+				if (!e.isFile() || e.name.endsWith(".tmp") || e.name.endsWith(".lock")) continue;
 				const rel = path.relative(dir, path.join(e.parentPath, e.name));
 				out.push(prefix + rel.split(path.sep).join("/"));
 			}
