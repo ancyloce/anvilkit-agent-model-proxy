@@ -102,6 +102,8 @@ export interface CallDeps {
 	pollMs?: number;
 	/** P2.3: the latest unpaid health probe per route; a failing route refuses new calls. */
 	health?: { healthy(routeId: string): boolean };
+	/** P3.6: counts each call's outcome (unknown with SENDER_LOST or PERMISSION_LOST included). */
+	outcomes?: { outcome(outcome: string, errorCode?: string): void };
 }
 
 /** An in-flight send owned by this process. */
@@ -401,6 +403,7 @@ export class CallService {
 				lost.record.frames = this.staticFrames(req.callId, route, (f) => f.error("unknown", "PERMISSION_LOST"));
 				lost.record.observations.push(this.observationOf(lost.record, "unknown", undefined, undefined));
 				await this.writeRecord(lost.record, lost.version);
+				this.d.outcomes?.outcome("unknown", "PERMISSION_LOST");
 				this.d.log.warn("admission answered without permission and without a record: the permission was lost", {
 					callId: req.callId,
 					dispatchId: admission.dispatchId,
@@ -787,6 +790,7 @@ export class CallService {
 			};
 		}
 		if (ticket.transportError) evidence.transportError = ticket.transportError;
+		this.d.outcomes?.outcome(settlement.outcome, settlement.errorCode);
 		this.d.log.info("call finished", {
 			callId: record.callId,
 			dispatchId: record.dispatchId,
@@ -1260,13 +1264,20 @@ export class CallService {
 	 * evidence is watched, one read per pass, for as long as it takes. A send
 	 * this process owns is never touched.
 	 */
-	async sweep(): Promise<{ resubmitted: number; reclaimed: number; completed: number; expired: number }> {
+	async sweep(): Promise<{
+		resubmitted: number;
+		reclaimed: number;
+		completed: number;
+		expired: number;
+		pending: number;
+	}> {
 		let resubmitted = 0;
 		let reclaimed = 0;
 		let completed = 0;
 		const grace = this.d.cfg.observation.reclaimGraceMs;
 		const visited = new Set<string>();
-		for (const scope of await this.d.store.listPending()) {
+		const pendingScopes = await this.d.store.listPending();
+		for (const scope of pendingScopes) {
 			if (this.live.has(keyOf(scope))) continue;
 			visited.add(keyOf(scope));
 			const found = await this.d.store.read(scope);
@@ -1318,6 +1329,7 @@ export class CallService {
 					throw err;
 				}
 				await this.d.store.markReclaimed(scope);
+				this.d.outcomes?.outcome("unknown", "SENDER_LOST");
 				this.d.log.warn("send reclaimed as unknown: the sender did not finish before the deadline", {
 					callId: scope.callId,
 					dispatchId: rec.dispatchId,
@@ -1388,7 +1400,7 @@ export class CallService {
 			}
 		}
 		const expired = await this.expire(batch);
-		return { resubmitted, reclaimed, completed, expired };
+		return { resubmitted, reclaimed, completed, expired, pending: pendingScopes.length };
 	}
 
 	/**

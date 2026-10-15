@@ -27,7 +27,7 @@ import type { Contract, ErrorCode, ErrorEnvelope, ModelCallRequest, StreamFrame 
 import { ContractViolation } from "../contracts.js";
 import { IdentityWatcher } from "../identity.js";
 import type { Logger } from "../log.js";
-import { type RequestObserver, routeOf } from "../telemetry.js";
+import { type RequestObserver, routeOf, traceContext } from "../telemetry.js";
 
 export interface Identity {
 	authenticate(req: IncomingMessage): Principal | undefined;
@@ -223,19 +223,24 @@ function answerClientError(err: Error & { code?: string }, socket: import("node:
 export function createServer(d: HttpDeps): Server {
 	const handler = (req: IncomingMessage, res: ServerResponse) => {
 		const target = parseTarget(req.url);
+		let traceparent = "";
 		if (d.observer) {
 			const done = d.observer.request(req.method ?? "GET", target ? routeOf(target.pathname) : "invalid", req.headers);
 			res.once("close", () => done(res.statusCode));
+			traceparent = done.traceparent ?? "";
 		}
-		handle(d, req, res, target).catch((err) => {
-			// handle() answers its own failures; this is the last guard of the
-			// listener: nothing thrown here reaches the process (P1.3, B-28).
-			d.log.error("request handler failed outside its guard", {
-				error: err instanceof Error ? err.message : String(err),
+		// P3.6: the request's trace context reaches the Control client (currentTraceparent).
+		traceContext
+			.run(traceparent, () => handle(d, req, res, target))
+			.catch((err) => {
+				// handle() answers its own failures; this is the last guard of the
+				// listener: nothing thrown here reaches the process (P1.3, B-28).
+				d.log.error("request handler failed outside its guard", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+				if (!res.headersSent) writeError(res, requestId(), "DEPENDENCY_UNAVAILABLE", "internal failure", true);
+				else res.destroy();
 			});
-			if (!res.headersSent) writeError(res, requestId(), "DEPENDENCY_UNAVAILABLE", "internal failure", true);
-			else res.destroy();
-		});
 	};
 	if (d.cfg.identity.mode === "mtls") {
 		// The watcher holds the validated material; every update it publishes

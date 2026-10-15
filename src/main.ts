@@ -75,7 +75,17 @@ export async function run(cfg: Config): Promise<void> {
 		log,
 	);
 	await routeHealth.start();
-	const calls = new CallService({ cfg, contract, control, store, log, instanceId, health: routeHealth });
+	const telemetry = new Telemetry(cfg.telemetry, "anvilkit-agent-model-proxy");
+	const calls = new CallService({
+		cfg,
+		contract,
+		control,
+		store,
+		log,
+		instanceId,
+		health: routeHealth,
+		outcomes: telemetry,
+	});
 	const identity: Identity =
 		cfg.identity.mode === "mtls"
 			? new MtlsIdentity(cfg.identity.mtls.principals)
@@ -96,7 +106,6 @@ export async function run(cfg: Config): Promise<void> {
 			});
 	}
 	let ready = false;
-	const telemetry = new Telemetry(cfg.telemetry, "anvilkit-agent-model-proxy");
 	const server = createServer({ cfg, contract, calls, identity, identityWatcher, log, observer: telemetry });
 	server.requestTimeout = 0;
 	server.headersTimeout = cfg.http.requestHeaderTimeoutMs;
@@ -113,17 +122,22 @@ export async function run(cfg: Config): Promise<void> {
 	await listen(server, cfg.http.listen);
 	// The sweep is off the readiness path (P1.3, MP-07): the first pass runs
 	// beside serving, and every pass is bounded (observation.sweep_batch).
-	const runSweep = () =>
-		calls.sweep().then(
-			(r) =>
+	const runSweep = () => {
+		const started = process.hrtime.bigint();
+		return calls.sweep().then(
+			(r) => {
+				telemetry.sweep(r, Number(process.hrtime.bigint() - started) / 1e9);
 				log.info("sweep pass", {
 					resubmitted: r.resubmitted,
 					reclaimed: r.reclaimed,
 					completed: r.completed,
 					expired: r.expired,
-				}),
+					pending: r.pending,
+				});
+			},
 			(err) => log.error("sweep failed", { error: String(err) }),
 		);
+	};
 	void runSweep();
 	const sweep = setInterval(() => void runSweep(), cfg.observation.sweepIntervalMs);
 	ready = true;
