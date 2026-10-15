@@ -13,6 +13,7 @@
     "check-types": "tsc --noEmit -p tsconfig.json",
     "lint": "biome check src test build.mjs",
     "test": "vitest run",
+    "stress": "vitest run --config vitest.stress.config.ts --silent=false --reporter=verbose",
     "start": "node dist/main.js"
   },
   "dependencies": {
