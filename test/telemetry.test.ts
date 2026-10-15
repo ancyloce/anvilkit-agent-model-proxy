@@ -49,4 +49,36 @@ describe("telemetry", () => {
 			/telemetry.otlp_endpoint/,
 		);
 	});
+
+	it("counts call outcomes and sweep passes without identifiers (P3.6)", async () => {
+		const t = new Telemetry({ otlpEndpoint: "", sampleRatio: 1 }, "test");
+		t.outcome("succeeded");
+		t.outcome("unknown", "SENDER_LOST");
+		t.outcome("unknown", "PERMISSION_LOST");
+		t.outcome("unknown", "SENDER_LOST");
+		t.sweep({ resubmitted: 2, reclaimed: 1, completed: 0, expired: 3, pending: 4 }, 0.25);
+		const metrics = await t.registry.metrics();
+		expect(metrics).toContain('anvilkit_model_proxy_call_outcomes_total{outcome="succeeded",error_code="none"} 1');
+		expect(metrics).toContain('anvilkit_model_proxy_call_outcomes_total{outcome="unknown",error_code="SENDER_LOST"} 2');
+		expect(metrics).toContain(
+			'anvilkit_model_proxy_call_outcomes_total{outcome="unknown",error_code="PERMISSION_LOST"} 1',
+		);
+		expect(metrics).toContain('anvilkit_model_proxy_sweep_entries_total{action="reclaimed"} 1');
+		expect(metrics).toContain('anvilkit_model_proxy_sweep_entries_total{action="expired"} 3');
+		expect(metrics).toContain("anvilkit_model_proxy_pending_observations 4");
+		expect(metrics).toContain("anvilkit_model_proxy_sweep_duration_seconds_count 1");
+		await t.shutdown();
+	});
+
+	it("hands the sampled server span's context to the request (P3.6)", async () => {
+		const exporter = new InMemorySpanExporter();
+		const t = new Telemetry({ otlpEndpoint: "", sampleRatio: 1 }, "test", new SimpleSpanProcessor({ exporter }));
+		const done = t.request("POST", "/api/v1/model-calls", {
+			traceparent: "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+		});
+		expect(done.traceparent).toMatch(/^00-0af7651916cd43dd8448eb211c80319c-[0-9a-f]{16}-01$/);
+		expect(done.traceparent).not.toContain("b7ad6b7169203331");
+		done(200);
+		await t.shutdown();
+	});
 });

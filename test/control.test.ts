@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ControlClient, ControlRefused, ControlUnavailable } from "../src/adapters/control.js";
+import { traceContext } from "../src/telemetry.js";
 import { FakeControl } from "./control.js";
 import { files, issue, mount, newCA, spiffe, tempDir } from "./pki.js";
 
@@ -137,5 +138,14 @@ describe("Control dispatch adapter", () => {
 		const unreachable = new ControlClient("127.0.0.1:1", 500, lab().identity);
 		await expect(unreachable.getDispatch("tenant_a", "dsp_x")).rejects.toBeInstanceOf(ControlUnavailable);
 		unreachable.close();
+	});
+
+	it("sends the request's trace context with every call (P3.6): Control's spans join the Proxy's trace", async () => {
+		const traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+		await traceContext.run(traceparent, () => admit("call_trace"));
+		expect(control.admitTraceparents.at(-1)).toBe(traceparent);
+		await admit("call_untraced");
+		// Outside a request no context is invented.
+		expect(control.admitTraceparents.at(-1)).toBe("");
 	});
 });

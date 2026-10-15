@@ -43,6 +43,8 @@ interface Recorded {
 export class FakeControl {
 	readonly dispatches = new Map<string, Recorded>();
 	readonly admits: AdmitModelRequest[] = [];
+	/** The W3C traceparent each admission arrived with ("" when none, P3.6). */
+	readonly admitTraceparents: string[] = [];
 	readonly observes: ObserveDispatchRequest[] = [];
 	/** Routes that are denied with the code (PROFILE_UNQUALIFIED, BUDGET_EXHAUSTED, ...). */
 	readonly denials = new Map<string, string>();
@@ -68,7 +70,10 @@ export class FakeControl {
 			admitModel: (
 				call: ServerUnaryCall<AdmitModelRequest, AdmitModelResponse>,
 				cb: sendUnaryData<AdmitModelResponse>,
-			) => void this.admit(call.request, cb),
+			) => {
+				this.admitTraceparents.push(String(call.metadata.get("traceparent")[0] ?? ""));
+				void this.admit(call.request, cb);
+			},
 			observeDispatch: (
 				call: ServerUnaryCall<ObserveDispatchRequest, ObserveDispatchResponse>,
 				cb: sendUnaryData<ObserveDispatchResponse>,

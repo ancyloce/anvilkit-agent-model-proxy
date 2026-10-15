@@ -1,3 +1,5 @@
+import { utimes, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { CallStore, FilesystemStore, type ObjectStore, PreconditionFailed, S3Store } from "../src/adapters/store.js";
 import { scratch } from "./helpers.js";
@@ -6,6 +8,28 @@ const enc = (s: string) => new TextEncoder().encode(s);
 
 function semantics(name: string, make: () => Promise<ObjectStore>) {
 	describe(name, () => {
+		it("unconditional writes of one key in one process at once never collide (P3.5): the last write wins", async () => {
+			const store = await make();
+			const key = `calls/concurrent-${Date.now()}`;
+			await Promise.all(Array.from({ length: 20 }, (_, i) => store.put(key, enc(`{"n":${i}}`))));
+			expect(new TextDecoder().decode((await store.get(key))?.body)).toMatch(/^\{"n":\d+\}$/);
+			await store.delete(key);
+		});
+
+		it("conditional replacements of one version at once (P3.5): exactly one wins, the rest fail the precondition", async () => {
+			const store = await make();
+			const key = `calls/conditional-${Date.now()}`;
+			const v1 = await store.put(key, enc('{"n":0}'), { ifNoneMatch: true });
+			const results = await Promise.allSettled(
+				Array.from({ length: 20 }, (_, i) => store.put(key, enc(`{"n":${i + 1}}`), { ifMatch: v1 })),
+			);
+			const won = results.filter((r) => r.status === "fulfilled");
+			expect(won).toHaveLength(1);
+			for (const r of results) if (r.status === "rejected") expect(r.reason).toBeInstanceOf(PreconditionFailed);
+			expect((await store.get(key))?.version).toBe((won[0] as PromiseFulfilledResult<string>).value);
+			await store.delete(key);
+		});
+
 		it("creates conditionally, replaces by version, lists completely and qualifies", async () => {
 			const store = await make();
 			await store.qualify();
@@ -102,6 +126,29 @@ function semantics(name: string, make: () => Promise<ObjectStore>) {
 }
 
 semantics("filesystem store (DEVELOPMENT_ONLY)", async () => new FilesystemStore(scratch()));
+
+describe("filesystem store across instances (P3.5)", () => {
+	it("two instances on one directory replace one version once; a dead writer's stale lock is broken; locks are not listed", async () => {
+		const dir = scratch();
+		const [a, b] = [new FilesystemStore(dir), new FilesystemStore(dir)];
+		const key = `calls/shared-${Date.now()}`;
+		const v1 = await a.put(key, enc('{"n":0}'), { ifNoneMatch: true });
+		const results = await Promise.allSettled([
+			...Array.from({ length: 10 }, (_, i) => a.put(key, enc(`{"a":${i}}`), { ifMatch: v1 })),
+			...Array.from({ length: 10 }, (_, i) => b.put(key, enc(`{"b":${i}}`), { ifMatch: v1 })),
+		]);
+		expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+		// A writer that died holding the lock: older than 30 s, it is broken.
+		const lock = path.join(dir, `${key}.lock`);
+		await writeFile(lock, "");
+		const old = new Date(Date.now() - 60_000);
+		await utimes(lock, old, old);
+		const current = await b.get(key);
+		await b.put(key, enc('{"n":2}'), { ifMatch: current?.version });
+		expect(await a.list("calls/")).toEqual([key]);
+		await a.delete(key);
+	});
+});
 
 const s3env = {
 	endpoint: process.env.ANVILKIT_DEV_ARTIFACTS_ENDPOINT,
