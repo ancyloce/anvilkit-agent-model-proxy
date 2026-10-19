@@ -33,10 +33,11 @@ WORKDIR /anvilkit/model-proxy
 # removed so their bundled packages (and their advisories) are not shipped.
 RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack \
       /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
-# Debian security fixes the base digest predates (CRITICAL with a fixed
-# version: CVE-2026-13221/42496/8376 perl-base), pinned to the fixed version.
+# Debian security fixes the base digest predates (with a fixed version:
+# CRITICAL CVE-2026-13221/42496/8376 perl-base; HIGH
+# CVE-2026-86145/89157/89161/103111 libpcre2), pinned to the fixed versions.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends --only-upgrade perl-base=5.36.0-7+deb12u4 \
+ && apt-get install -y --no-install-recommends --only-upgrade perl-base=5.36.0-7+deb12u4 libpcre2-8-0=10.42-1+deb12u2 \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/node_modules ./node_modules
 COPY --from=build /src/dist ./dist
