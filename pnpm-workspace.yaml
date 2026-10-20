@@ -19,8 +19,3 @@ allowBuilds:
 minimumReleaseAgeExclude:
   - '@types/node@24.13.5'
   - '@aws-sdk/client-s3@3.1134.0'
-# Security fix that the exact pin forbids: @anvilkit/generated-clients pins
-# @grpc/grpc-js 1.14.4 (CVE-2026-101916, fixed in 1.14.5). The selector names
-# the vulnerable version only; drop it once the pin moves past it.
-overrides:
-  '@grpc/grpc-js@1.14.4': 1.14.5

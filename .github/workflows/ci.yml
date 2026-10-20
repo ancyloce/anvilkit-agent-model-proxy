@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ancyloce/anvilkit-agent-contracts
-          ref: 8727513577e2723ebd7c40439e094da1cd5ad88d
+          ref: 634d6495a06307a7d80901f0ea878ba7eaff1529
           path: contracts
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ancyloce/anvilkit-agent-contracts
-          ref: 8727513577e2723ebd7c40439e094da1cd5ad88d
+          ref: 634d6495a06307a7d80901f0ea878ba7eaff1529
           path: contracts
       - run: docker build --build-context contracts=contracts -t anvilkit-agent-model-proxy:ci .
   chart:
