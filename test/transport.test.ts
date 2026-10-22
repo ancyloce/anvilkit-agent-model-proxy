@@ -399,6 +399,11 @@ describe("pi-ai openai-completions path on the ticket's fetch", () => {
 		expect(r.headers.authorization).toBe(`Bearer ${credential}`);
 		expect(r.headers["user-agent"]).toBe("anvilkit-agent-model-proxy");
 		expect(Object.keys(r.headers).some((h) => h.startsWith("x-anvilkit-"))).toBe(false);
+		// pi-ai 1.4.0 adds client-identity attribution headers only when an
+		// identity is passed; the service passes none and keeps its own
+		// User-Agent (options headers merge last).
+		expect(r.headers["http-referer"]).toBeUndefined();
+		expect(r.headers["x-title"]).toBeUndefined();
 		const body = JSON.parse(r.body) as Record<string, unknown>;
 		expect(body.model).toBe("fixture-model");
 		expect(body.stream).toBe(true);
@@ -422,6 +427,23 @@ describe("pi-ai openai-completions path on the ticket's fetch", () => {
 		const native = nativeUsageFromSse(ticket.response?.body ?? new Uint8Array());
 		expect(native?.usage).toMatchObject({ prompt_tokens: 12, completion_tokens: 5 });
 		expect(native?.responseId).toBe("chatcmpl-fixture");
+	});
+
+	it("a tool call whose arguments are not a JSON object ends the call as an error: no tool_call frame (pi-ai 1.3.0+ argumentsError)", async () => {
+		up.next({
+			kind: "stream",
+			text: ["Reading"],
+			toolCall: { id: "call_bad", name: "read_brief", arguments: '{"section": ' },
+		});
+		const before = up.receives.length;
+		const ticket = new SendTicket("call_p1x", `${up.url}/v1`, credential, 1 << 20);
+		const events = await collect(streamUpstream(input(ticket)));
+		expect(up.receives.length).toBe(before + 1);
+		expect(events.some((e) => e.type === "tool_call")).toBe(false);
+		const last = events.at(-1);
+		expect(last?.type).toBe("error");
+		expect((last as Extract<UpstreamEvent, { type: "error" }>).message).toMatch(/^UPSTREAM_TOOL_ARGUMENTS_INVALID/);
+		await ticket.settled;
 	});
 
 	it("replays an assistant tool call and its tool result as the round trip the protocol states", async () => {

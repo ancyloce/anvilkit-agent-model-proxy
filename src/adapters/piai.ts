@@ -193,6 +193,21 @@ export async function* streamUpstream(input: UpstreamInput): AsyncGenerator<Upst
 				yield { type: "text", delta: ev.delta };
 				break;
 			case "toolcall_end":
+				// pi-ai 1.3.0+: a tool call whose complete arguments text is not a
+				// JSON object arrives with `arguments: {}` and `argumentsError`
+				// (1.1.0 returned the fields parsed before the error). Neither is
+				// a tool call the executor may run: the call ends as an error and
+				// no tool_call frame is relayed. Native evidence and metering keep
+				// the usage of the send.
+				if (ev.toolCall.argumentsError !== undefined) {
+					yield {
+						type: "error",
+						reason: "error",
+						message: `UPSTREAM_TOOL_ARGUMENTS_INVALID: tool call ${ev.toolCall.id}`,
+						final: ev.partial,
+					};
+					return;
+				}
 				yield {
 					type: "tool_call",
 					id: ev.toolCall.id,

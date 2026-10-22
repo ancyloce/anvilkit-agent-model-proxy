@@ -19,3 +19,5 @@ allowBuilds:
 minimumReleaseAgeExclude:
   - '@types/node@24.13.5'
   - '@aws-sdk/client-s3@3.1134.0'
+  - '@earendil-works/pi-ai@1.4.0'
+  - '@earendil-works/pi-telemetry@1.4.0'
