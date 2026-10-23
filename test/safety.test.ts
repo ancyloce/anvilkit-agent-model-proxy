@@ -113,9 +113,17 @@ describe("P1.3 process and settlement safety", () => {
 				);
 				expect(line, `${listener} ${target}`).toMatch(/^HTTP\/1\.1 (400|404)/);
 			}
+			// The parser refuses the line at its limit while the client is still
+			// sending; Node stops reading the socket after a parser error, so the
+			// close that follows the 400 can carry unread bytes and the kernel turns
+			// it into a reset (observed in 0.1-0.5 % of attempts, more under load;
+			// Node's default handler behaves the same). A reset is the same refusal
+			// without the status line; only the listener's survival is asserted next.
 			const huge = `GET /${"a".repeat(64 * 1024)} HTTP/1.1\r\nHost: proxy\r\n${auth}Connection: close\r\n\r\n`;
-			const line = await rawRequest(listener, huge);
-			expect(line, `${listener} 64 KiB request line`).toMatch(/^HTTP\/1\.1 400/);
+			const line = await rawRequest(listener, huge).catch((e: NodeJS.ErrnoException) =>
+				e.code === "ECONNRESET" ? "RESET" : Promise.reject(e),
+			);
+			expect(line, `${listener} 64 KiB request line`).toMatch(/^(HTTP\/1\.1 400|RESET$)/);
 		}
 		// The process serves on; the send held meanwhile ends through its own path.
 		const health = await call(proxy.healthUrl, "GET", "/healthz", undefined, null);
@@ -123,8 +131,12 @@ describe("P1.3 process and settlement safety", () => {
 		expect(proxy.calls.inFlight).toBe(1);
 		await partial;
 		up.release();
-		await new Promise((r) => setTimeout(r, 300));
-		const rec = (await proxy.store.read(scope(held)))?.record;
+		// The settlement is asynchronous; wait bounded for the record to leave "sending".
+		let rec = (await proxy.store.read(scope(held)))?.record;
+		for (let i = 0; i < 50 && rec?.state === "sending"; i++) {
+			await new Promise((r) => setTimeout(r, 100));
+			rec = (await proxy.store.read(scope(held)))?.record;
+		}
 		expect(rec?.state).toBe("unknown");
 		expect(["USAGE_MISSING", "UPSTREAM_ERROR"]).toContain(rec?.errorCode);
 	});
