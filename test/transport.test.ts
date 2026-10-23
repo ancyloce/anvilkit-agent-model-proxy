@@ -442,7 +442,10 @@ describe("pi-ai openai-completions path on the ticket's fetch", () => {
 		expect(events.some((e) => e.type === "tool_call")).toBe(false);
 		const last = events.at(-1);
 		expect(last?.type).toBe("error");
-		expect((last as Extract<UpstreamEvent, { type: "error" }>).message).toMatch(/^UPSTREAM_TOOL_ARGUMENTS_INVALID/);
+		const error = last as Extract<UpstreamEvent, { type: "error" }>;
+		expect(error.code).toBe("UPSTREAM_TOOL_ARGUMENTS_INVALID");
+		// The message names the call, never the arguments text.
+		expect(error.message).not.toContain("section");
 		await ticket.settled;
 	});
 

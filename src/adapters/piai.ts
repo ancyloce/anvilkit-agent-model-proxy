@@ -28,7 +28,18 @@ export type UpstreamEvent =
 	| { type: "text"; delta: string }
 	| { type: "tool_call"; id: string; name: string; arguments: string }
 	| { type: "done"; reason: "stop" | "length" | "toolUse" | "deferred"; message: AssistantMessage }
-	| { type: "error"; reason: "aborted" | "error"; message: string; final: AssistantMessage };
+	| {
+			type: "error";
+			reason: "aborted" | "error";
+			message: string;
+			final: AssistantMessage;
+			/**
+			 * The adapter's own classification of the failure when the SDK's
+			 * event establishes it (a structured fact of the stream, never read
+			 * from a message text): the settlement carries it as the error code.
+			 */
+			code?: "UPSTREAM_TOOL_ARGUMENTS_INVALID";
+	  };
 
 export interface UpstreamInput {
 	route: Route;
@@ -200,10 +211,13 @@ export async function* streamUpstream(input: UpstreamInput): AsyncGenerator<Upst
 				// no tool_call frame is relayed. Native evidence and metering keep
 				// the usage of the send.
 				if (ev.toolCall.argumentsError !== undefined) {
+					// The arguments text itself stays in the native evidence, never
+					// in the message.
 					yield {
 						type: "error",
 						reason: "error",
-						message: `UPSTREAM_TOOL_ARGUMENTS_INVALID: tool call ${ev.toolCall.id}`,
+						code: "UPSTREAM_TOOL_ARGUMENTS_INVALID",
+						message: `tool call ${ev.toolCall.id}: the arguments are not a JSON object`,
 						final: ev.partial,
 					};
 					return;

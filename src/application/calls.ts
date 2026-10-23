@@ -718,6 +718,7 @@ export class CallService {
 			);
 		}, this.pollMs);
 		let upstreamError: string | undefined;
+		let upstreamCode: string | undefined;
 		try {
 			// A cancel that reached the store before the first byte leaves is
 			// honored without a send.
@@ -748,6 +749,7 @@ export class CallService {
 							break;
 						case "error":
 							upstreamError = ev.message;
+							upstreamCode = ev.code;
 							break;
 					}
 				} catch (err) {
@@ -768,7 +770,7 @@ export class CallService {
 		}
 		// The evidence branch of the transport finishes with the response.
 		await Promise.race([ticket.settled, sleep(5_000)]);
-		const settlement = this.settle(live, ticket, upstreamError, frames, record.callId);
+		const settlement = this.settle(live, ticket, upstreamError, upstreamCode, frames, record.callId);
 		const evidence: NativeEvidence = {
 			callId: record.callId,
 			tenantId: record.tenantId,
@@ -850,6 +852,7 @@ export class CallService {
 		live: LiveCall,
 		ticket: SendTicket,
 		upstreamError: string | undefined,
+		upstreamCode: string | undefined,
 		frames: Frames,
 		callId: string,
 	): Settlement {
@@ -889,8 +892,13 @@ export class CallService {
 			outcome = usage ? "failed" : "unknown";
 			errorCode = live.boundCode;
 		} else if (upstreamError !== undefined || !okStatus) {
+			// The class names what failed (a status, the adapter's structured
+			// classification of the stream, or an unclassified error); whether
+			// the send is settled or an uncertain exposure is the usage's
+			// question alone.
 			outcome = usage ? "failed" : "unknown";
-			errorCode = ticket.response && !okStatus ? `UPSTREAM_STATUS_${ticket.response.status}` : "UPSTREAM_ERROR";
+			if (ticket.response && !okStatus) errorCode = `UPSTREAM_STATUS_${ticket.response.status}`;
+			else errorCode = upstreamCode ?? "UPSTREAM_ERROR";
 		} else if (report?.kind === "complete" && !complete) {
 			// The counters arrived but the stream was cut before its end: what
 			// they count is a lower bound, not the send's usage.

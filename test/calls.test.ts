@@ -446,6 +446,99 @@ describe("controlled calls", () => {
 		expect(control.byCall(callId)?.observations[0]?.usage).toMatchObject({ input: "12", output: "5" });
 	});
 
+	it("a tool call whose arguments are not a JSON object is the model's fault: UPSTREAM_TOOL_ARGUMENTS_INVALID with the actual usage, no tool_call frame, one send", async () => {
+		const before = up.receives.length;
+		up.next({
+			kind: "stream",
+			text: ["Reading"],
+			toolCall: { id: "call_bad", name: "read_brief", arguments: '{"section": "he"ro"}' },
+		});
+		const callId = id("bad-arguments");
+		const body = requestBody(callId, {
+			tools: [{ name: "read_brief", inputSchemaDigest: toolSchemaDigest(readBriefSchema) }],
+		});
+		const first = await call(proxy.url, "POST", "/api/v1/model-calls", body);
+		expect(first.status, first.text).toBe(200);
+		// No executable tool call leaves the relay; the class is the structured code, not a message prefix.
+		expect(first.frames.some((f) => f.type === "tool_call")).toBe(false);
+		expect(first.frames.at(-1)).toMatchObject({
+			type: "error",
+			outcome: "failed",
+			errorCode: "UPSTREAM_TOOL_ARGUMENTS_INVALID",
+			usage: { inputUnits: "12", outputUnits: "5" },
+		});
+		expect(up.receives.length).toBe(before + 1);
+		// The persisted record, the evidence settlement and the observation carry the same class; the send is chargeable.
+		const rec = await call(proxy.url, "GET", `/api/v1/model-calls/${callId}`);
+		expect(rec.json).toMatchObject({ state: "failed", errorCode: "UPSTREAM_TOOL_ARGUMENTS_INVALID" });
+		expect(evidenceOf(callId).settlement).toMatchObject({
+			outcome: "failed",
+			errorCode: "UPSTREAM_TOOL_ARGUMENTS_INVALID",
+		});
+		expect(control.byCall(callId)?.state).toBe(DispatchState.DISPATCH_STATE_OBSERVED);
+		expect(control.byCall(callId)?.observations).toHaveLength(1);
+		expect(control.byCall(callId)?.observations[0]?.outcome).toBe(DispatchOutcome.DISPATCH_OUTCOME_FAILED);
+		expect(control.byCall(callId)?.observations[0]?.usage).toMatchObject({ input: "12", output: "5" });
+		// Reentry replays the recorded frames; nothing is resent.
+		const replay = await call(proxy.url, "POST", "/api/v1/model-calls", body);
+		expect(replay.frames).toEqual(first.frames);
+		expect(up.receives.length).toBe(before + 1);
+	});
+
+	it("invalid tool arguments without usage keep the class but stay unknown: the exposure is retained, never zero", async () => {
+		const before = up.receives.length;
+		up.next({
+			kind: "stream",
+			toolCall: { id: "call_bad2", name: "read_brief", arguments: '["not", "an", "object"]' },
+			usage: null,
+		});
+		const callId = id("bad-arguments-no-usage");
+		const r = await call(
+			proxy.url,
+			"POST",
+			"/api/v1/model-calls",
+			requestBody(callId, { tools: [{ name: "read_brief", inputSchemaDigest: toolSchemaDigest(readBriefSchema) }] }),
+		);
+		expect(r.status, r.text).toBe(200);
+		expect(r.frames.some((f) => f.type === "tool_call")).toBe(false);
+		expect(r.frames.at(-1)).toMatchObject({
+			type: "error",
+			outcome: "unknown",
+			errorCode: "UPSTREAM_TOOL_ARGUMENTS_INVALID",
+		});
+		expect(r.frames.at(-1)?.usage).toBeUndefined();
+		expect(up.receives.length).toBe(before + 1);
+		expect(control.byCall(callId)?.state).toBe(DispatchState.DISPATCH_STATE_UNKNOWN);
+		expect(control.byCall(callId)?.observations[0]?.usage).toBeUndefined();
+	});
+
+	it("an upstream failure whose body names the code keeps its own class: text never classifies, the status does", async () => {
+		up.next({
+			kind: "status",
+			status: 500,
+			body: '{"error":{"message":"UPSTREAM_TOOL_ARGUMENTS_INVALID: tool call x"}}',
+		});
+		const callId = id("status-names-code");
+		const r = await call(proxy.url, "POST", "/api/v1/model-calls", requestBody(callId));
+		expect(r.status).toBe(200);
+		expect(r.frames.at(-1)).toMatchObject({ type: "error", outcome: "unknown", errorCode: "UPSTREAM_STATUS_500" });
+		// A valid tool call whose text mentions the code is an ordinary success.
+		up.next({
+			kind: "stream",
+			text: ["UPSTREAM_TOOL_ARGUMENTS_INVALID is a code, not an event"],
+			toolCall: { id: "call_ok", name: "read_brief", arguments: '{"section":"hero"}' },
+		});
+		const okId = id("text-names-code");
+		const ok = await call(
+			proxy.url,
+			"POST",
+			"/api/v1/model-calls",
+			requestBody(okId, { tools: [{ name: "read_brief", inputSchemaDigest: toolSchemaDigest(readBriefSchema) }] }),
+		);
+		expect(ok.frames.some((f) => f.type === "tool_call")).toBe(true);
+		expect(ok.frames.at(-1)).toMatchObject({ type: "done", outcome: "succeeded" });
+	});
+
 	it("a completion sentinel without HTTP EOF stays unknown after the bounded drain and never resends", async () => {
 		const before = up.receives.length;
 		up.next({ kind: "stream", text: ["Done?"], hangAfterDone: true });
