@@ -24,7 +24,7 @@ The Model Proxy of the AnvilKit Agent platform: the sole runtime holder of model
 TypeScript boundaries: `main (bootstrap) -> transport -> application -> domain`, adapters implement the application's ports, `contracts.ts` is the generated boundary. The generated contract consumers (`@anvilkit/generated-clients`, `ts/` of the contracts repository) are a git-hosted dependency pinned by commit and content integrity in `pnpm-lock.yaml` (the contracts commit in the generated line below, the TypeScript analogue of a Go pseudo-version; `.github/workflows/ci.yml` checks the same commit out and the `Dockerfile` accepts the contract document at that commit's digest only). The contract package's own runtime dependencies (`lossless-json`, `jsonc-parser`) are declared here as well: the bundle compiles the package in and leaves every other import external, and pnpm's layout resolves only this package's declared dependencies from `dist/` — `build.mjs` checks esbuild's metafile and fails the build on an external import that is not a production dependency. Nothing is read from a sibling checkout except the contract document itself, which the environment (or the image's named build context) names.
 
 <!-- generated:contracts -->
-Contracts: this build pins `@anvilkit/generated-clients` to contracts commit `0f7afca` (`package.json`; tag `go/v0.1.14`).
+Contracts: this build pins `@anvilkit/generated-clients` to contracts commit `6ee298d` (`package.json`; tag `go/v0.1.15`).
 <!-- /generated:contracts -->
 
 ## What the Proxy guarantees, and how it is checked
