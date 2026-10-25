@@ -21,3 +21,8 @@ minimumReleaseAgeExclude:
   - '@aws-sdk/client-s3@3.1134.0'
   - '@earendil-works/pi-ai@1.4.0'
   - '@earendil-works/pi-telemetry@1.4.0'
+# Security fix that the exact pin forbids (release policy: no fixable HIGH):
+# express 5.2.1 pins body-parser 2.3.0 (CVE-2026-111181, fixed in 2.4.0).
+# Drop it once the pin moves past it.
+overrides:
+  body-parser: 2.4.0
