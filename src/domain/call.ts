@@ -86,7 +86,8 @@ export interface CallRecord {
 	/**
 	 * The creator's stamp (P1.3, MP-10): the instance that created the
 	 * record and the nonce of that one create attempt. A conditional create
-	 * whose success answer was lost and that the SDK repeated is recognised
+	 * whose success answer was lost and that the store's AWS SDK client
+	 * repeated is recognised
 	 * by the holder as its own write, not as another instance's record.
 	 */
 	createdBy?: string;
