@@ -3,9 +3,11 @@
 // ANVILKIT_MODEL_PROXY_* environment. Unknown keys, unknown environment
 // variables, missing values, out-of-range values and contradictory settings
 // stop the process before it listens. Provider credentials are never in the
-// file: a route names the environment variable that carries its credential,
-// and a route whose inputs are incomplete (no credential, no reviewed tool
-// schema, an unimplemented API) is not served — nothing is invented for it.
+// file: a route names the environment variable that carries its credential.
+// Nothing is invented for incomplete inputs: a route without its credential
+// is not served, a call naming a tool without a reviewed schema of its
+// route is refused, and an API this build does not implement stops the
+// process.
 import { readFileSync } from "node:fs";
 import { parse as parseYaml } from "yaml";
 
@@ -76,7 +78,7 @@ export interface MtlsFiles {
 }
 
 export interface Config {
-	/** The top-level DEVELOPMENT_ONLY guard: the bearer listener identity and the plaintext Control transport need their own development mode and this; it downgrades nothing by itself. File-only. */
+	/** The top-level DEVELOPMENT_ONLY guard: the bearer listener identity and the plaintext Control transport need their own development mode and this, and a plaintext http:// store endpoint needs this; it downgrades nothing by itself. File-only. */
 	development: { enabled: boolean };
 	http: {
 		listen: string;
@@ -86,7 +88,7 @@ export interface Config {
 		slowConsumerGraceMs: number;
 		shutdownTimeoutMs: number;
 	};
-	/** The plaintext probe listener: /healthz, /readyz and /metrics only, no identity, no business route (the kubelet presents no client certificate). */
+	/** The plaintext probe listener: /healthz, /readyz, /metrics and /drain only, no identity, no business route (the kubelet presents no client certificate). */
 	health: { listen: string };
 	/** Spans over OTLP/HTTP to the collector when placed (none otherwise), sampled at sampleRatio. */
 	telemetry: { otlpEndpoint: string; sampleRatio: number };
@@ -817,17 +819,17 @@ export function disabled(cfg: Config): boolean {
 	return cfg.identity.mode === "disabled";
 }
 
-/**
- * The reasons a route is not served, empty for a served route: the file may
- * declare a route whose deployment inputs are incomplete; such a route is
- * denied, never approximated.
- */
 /** Loopback hosts: 127.0.0.0/8, ::1 and localhost. */
 export function isLoopbackHost(hostname: string): boolean {
 	const h = hostname.replace(/^\[|\]$/g, "").toLowerCase();
 	return h === "localhost" || h === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
+/**
+ * The reasons a route is not served, empty for a served route: the file may
+ * declare a route whose deployment inputs are incomplete; such a route is
+ * denied, never approximated.
+ */
 export function routeDisabledReasons(cfg: Config, route: Route): string[] {
 	const reasons: string[] = [];
 	if (!route.enabled) reasons.push("enabled: false");

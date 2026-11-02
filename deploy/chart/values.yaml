@@ -5,7 +5,7 @@
 # buckets, replica counts, Secret names, the pinned image digest) and the
 # route credentials themselves are supplied by the deploying repository per
 # environment; secrets never enter this chart, and a route whose credential
-# Secret is not referenced is not served.
+# is not supplied is not served.
 
 image:
   repository: anvilkit-agent-model-proxy
@@ -18,8 +18,9 @@ replicaCount: 2
 
 # HorizontalPodAutoscaler (autoscaling/v2). Off unless the environment enables
 # it with an explicit maxReplicas: the maximum is bounded by downstream caps
-# and the database connection budget (deploy/gitops/lock.yaml), never a chart
-# default. While enabled the Deployment leaves replicas to the autoscaler.
+# (the Proxy holds no database pool) and declared in the deployment lock
+# (deploy/gitops/lock.yaml), never a chart default. While enabled the
+# Deployment leaves replicas to the autoscaler.
 autoscaling:
   enabled: false
   minReplicas: 2
@@ -40,16 +41,14 @@ listen:
   port: 9103
 
 # The probe listener inside the Pod (ANVILKIT_MODEL_PROXY_HEALTH_LISTEN):
-# plaintext, /healthz and /readyz only, no identity and no business route.
+# plaintext, /healthz, /readyz, /metrics and /drain only, no identity and no
+# business route.
 # The kubelet's httpGet probes present no client certificate, so they never
 # target the mTLS business listener; the Service does not expose this port.
 health:
   port: 9104
 
 # Control's DispatchService (ANVILKIT_MODEL_PROXY_CONTROL_ADDRESS). Required.
-# identity.mode development is the plaintext gRPC of the development
-# foundation; mtls mounts the workload certificate files from mtlsSecret
-# (keys tls.crt, tls.key, ca.crt) at /etc/anvilkit/control-mtls.
 control:
   address: ""
   # identity.mode mtls (the default) presents the workload certificate and
@@ -67,10 +66,11 @@ control:
 
 # The callers' identity. development mounts the DEVELOPMENT_ONLY bearer
 # principals file from principalsSecret (key principals.json); mtls serves
-# TLS with the server certificate of mtlsSecret (tls.crt, tls.key, ca.crt)
-# and maps the client certificate's one SPIFFE URI SAN to a principal
-# through config.identity.mtls.principals ({spiffe_id, principal_id, kind};
-# the common name is never consulted).
+# TLS with the workload certificate (certificate below, or mtlsSecret with
+# tls.crt, tls.key, ca.crt when create is false) and maps the client
+# certificate's one SPIFFE URI SAN to a principal through
+# config.identity.mtls.principals ({spiffe_id, principal_id, kind}; the
+# common name is never consulted).
 identity:
   mode: mtls
   principalsSecret:
@@ -104,7 +104,8 @@ development:
 # is DEVELOPMENT_ONLY and per host). Endpoint and bucket are placements
 # (ANVILKIT_MODEL_PROXY_STORE_S3_{ENDPOINT,BUCKET}); the credentials come
 # from an existing Secret (ANVILKIT_MODEL_PROXY_STORE_S3_{ACCESS_KEY_ID,
-# SECRET_ACCESS_KEY}). Required.
+# SECRET_ACCESS_KEY}) under secrets.provider kubernetes, or from the CSI
+# mount of secrets below. Required.
 store:
   s3:
     endpoint: ""
@@ -141,18 +142,18 @@ trust:
 
 # Route credentials: one entry per served route, naming the environment
 # variable the route declares (credential_env) and the existing Secret and
-# key holding the provider credential. A route without an entry here is
-# declared but not served.
+# key holding the provider credential. A route whose credential neither an
+# entry here, credentialCSI.files nor secrets.csi.providerCredentials
+# supplies is declared but not served.
 routeCredentials: []
-# Optional CSI volume: credential files are readable only by this workload.
-credentialCSI:
-  secretProviderClass: ""
-  files: [] # [{env: ANVILKIT_MODEL_PROXY_CREDENTIAL_DEEPSEEK, name: deepseek-api-key}]
-
 #  - env: ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1
 #    secret:
 #      name: model-proxy-route-controlled
 #      key: credential
+# Optional CSI volume: credential files are readable only by this workload.
+credentialCSI:
+  secretProviderClass: ""
+  files: [] # [{env: ANVILKIT_MODEL_PROXY_CREDENTIAL_DEEPSEEK, name: deepseek-api-key}]
 
 # The reviewed, secret-free configuration file (config.yaml sections),
 # rendered into a ConfigMap and mounted at ANVILKIT_MODEL_PROXY_CONFIG. The
@@ -230,8 +231,9 @@ resources:
     memory: 512Mi
 
 # On the health port: /readyz answers 200 once the store is qualified, the
-# sweep ran and the business listener is up, 503 while the process drains;
-# /healthz answers while the process runs.
+# route health probes ran and the business listener is up (the first sweep
+# runs beside serving), 503 while the process drains; /healthz answers
+# while the process runs.
 probes:
   startup:
     periodSeconds: 2

@@ -4,7 +4,9 @@
 // current workload certificate and verifies the server against the current
 // CA bundle with standard hostname verification by the reviewed server
 // name. An invalid update never becomes active material. This is the
-// per-repository copy of the client half of the Knowledge module.
+// per-repository copy of the client half of the Knowledge module; the mTLS
+// business listener (transport/http.ts) takes its secure context from the
+// same watcher.
 import { createHash, createPrivateKey, X509Certificate } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { type ChannelCredentials, type ChannelOptions, experimental } from "@grpc/grpc-js";

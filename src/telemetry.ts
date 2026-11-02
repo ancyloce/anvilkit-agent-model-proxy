@@ -33,18 +33,19 @@ export interface TelemetryConfig {
 	sampleRatio: number;
 }
 
-/** Observes one request: returns the function that records its end. */
 /** The end of an observed request; traceparent is its server span's context when one is sampled. */
 export type RequestHandle = ((status: number) => void) & { traceparent?: string };
 
 export interface RequestObserver {
+	/** Observes one request: returns the function that records its end. */
 	request(method: string, route: string, headers: IncomingHttpHeaders): RequestHandle;
 }
 
 /**
  * P3.6: the outcomes of model calls (succeeded, failed, unknown with its
- * code: SENDER_LOST, PERMISSION_LOST, ...) and the sweep's passes, counted
- * for the operator's alerts; counts only, never a call identifier.
+ * code: SENDER_LOST, PERMISSION_LOST, ...), counted for the operator's
+ * alerts; counts only, never a call identifier. The sweep's passes are
+ * counted by Telemetry.sweep.
  */
 export interface CallObserver {
 	outcome(outcome: string, errorCode?: string): void;
@@ -141,8 +142,9 @@ export class Telemetry implements RequestObserver, CallObserver {
 
 	request(method: string, route: string, headers: IncomingHttpHeaders): RequestHandle {
 		const start = process.hrtime.bigint();
-		// The callers are the Workflow and the access sidecar: their trace
-		// context is continued, nothing else of the request is read.
+		// The callers are the Workflow, the access sidecar and Control's
+		// recovery queries: their trace context is continued, nothing else of
+		// the request is read.
 		const parent = this.propagator.extract(ROOT_CONTEXT, { traceparent: headers.traceparent }, defaultTextMapGetter);
 		const span = this.tracer.startSpan(
 			`${method} ${route}`,

@@ -120,9 +120,9 @@ spec:
           lifecycle:
             preStop:
               exec:
-                # Readiness goes first (the process withdraws it on SIGTERM as
-                # well); the pause lets the endpoint removal propagate before
-                # the drain starts.
+                # The pause lets the terminating Pod's endpoint removal
+                # propagate before SIGTERM starts the drain (the process
+                # withdraws its readiness on SIGTERM).
                 command: ["/bin/sh", "-c", "sleep {{ .Values.preStopSeconds }}"]
           startupProbe:
             httpGet:

@@ -34,7 +34,8 @@ export type CallState = ModelCallState;
  * The identity of a call in this Proxy: Control's dispatch identity
  * (tenant, owner, callId) without the constant owner. Call ids are unique
  * per tenant, never globally; every object of a call (record, evidence,
- * pending marker, cancel intent) is addressed by this scope.
+ * pending marker, cancel intent, reclaimed index entry) is addressed by
+ * this scope.
  */
 export interface CallScope {
 	tenantId: string;
@@ -94,9 +95,10 @@ export interface CallRecord {
 	createNonce?: string;
 	/**
 	 * When a sweep reclaimed the send as unknown (SENDER_LOST) without
-	 * evidence: the pending marker stays for the late-settlement window
-	 * after this instant so the sender's evidence, landing late, is still
-	 * discovered by any instance.
+	 * evidence: the send is indexed under `reclaimed` (the pending marker
+	 * goes once the reclaim's observation is submitted), so the sender's
+	 * evidence, however late it lands, is still discovered by any instance;
+	 * such a record is never expired while its evidence is missing.
 	 */
 	reclaimedAt?: string;
 }

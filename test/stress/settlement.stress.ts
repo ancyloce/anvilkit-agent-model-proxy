@@ -1,4 +1,4 @@
-// P3.5 AC4: the stress case of the open IT-MODEL-PROXY intermittent (P22,
+// P3.5 AC4: the stress case of the IT-MODEL-PROXY intermittent (P22,
 // run 20260930T231937Z: an invalid-usage call carried two usage observations
 // where one was asserted). Two Proxy instances on one store; the sender is
 // instance A, instance B sweeps in a tight loop while A's calls settle.

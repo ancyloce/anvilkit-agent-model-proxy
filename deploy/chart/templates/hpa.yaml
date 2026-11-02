@@ -1,7 +1,8 @@
 {{- if .Values.autoscaling.enabled }}
 {{- /* The environment supplies an explicit maximum: it is bounded by the
-downstream caps and the database connection budget of the deployment lock,
-so the chart has no default for it. Two replicas are the HA floor. */}}
+downstream caps (the Proxy holds no database pool) and declared in the
+deployment lock, so the chart has no default for it. Two replicas are the
+HA floor. */}}
 {{- if lt (int .Values.autoscaling.minReplicas) 2 }}
 {{- fail "autoscaling.minReplicas must be at least 2" }}
 {{- end }}

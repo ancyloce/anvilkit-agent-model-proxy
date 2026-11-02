@@ -280,8 +280,9 @@ export function createServer(d: HttpDeps): Server {
 /**
  * The probe listener: GET /healthz answers while the process runs, GET
  * /readyz while the service accepts calls, GET /metrics the request and
- * process metrics when given; nothing else is served and no identity is
- * checked, so it must not be exposed beyond the Pod (probes and scraping).
+ * process metrics and GET /drain the readiness withdrawal when given;
+ * nothing else is served and no identity is checked, so it must not be
+ * exposed beyond the Pod (probes and scraping).
  */
 export function createHealthServer(ready: () => boolean, metrics?: Registry, drain?: () => void): Server {
 	const server = createHttpServer((req, res) => {

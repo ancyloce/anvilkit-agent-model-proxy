@@ -1,6 +1,8 @@
 # anvilkit-agent-model-proxy configuration (reviewed, secret-free). Loaded by
 # src/config.ts with precedence defaults < this file < the allowlisted
-# environment overrides: ANVILKIT_MODEL_PROXY_LISTEN,
+# environment overrides (envOverrides in src/config.ts):
+# ANVILKIT_MODEL_PROXY_LISTEN, ANVILKIT_MODEL_PROXY_HEALTH_LISTEN,
+# ANVILKIT_MODEL_PROXY_TELEMETRY_OTLP_ENDPOINT,
 # ANVILKIT_MODEL_PROXY_CONTROL_ADDRESS, ANVILKIT_MODEL_PROXY_IDENTITY_{CERT,KEY,CA}_FILE,
 # ANVILKIT_MODEL_PROXY_CONTROL_IDENTITY_{CERT,KEY,CA}_FILE, ANVILKIT_MODEL_PROXY_PRINCIPALS_FILE
 # (the DEVELOPMENT_ONLY bearer principals of identity.mode development),
@@ -9,12 +11,13 @@
 # (s3 backend; the key pair is a secret, also accepted as the mounted secret
 # files ANVILKIT_MODEL_PROXY_STORE_S3_{ACCESS_KEY_ID,SECRET_ACCESS_KEY}_FILE,
 # never both sources; outside development the endpoint must be https://),
-# ANVILKIT_MODEL_PROXY_CONTRACTS_DIR
-# and the route credentials ANVILKIT_MODEL_PROXY_CREDENTIAL_<NAME> that the
-# routes below declare. Unknown keys and any other ANVILKIT_MODEL_PROXY_*
-# variable fail startup. Provider credentials, principals, store placements
-# and the contracts directory are refused inside this file. With
-# identity.mode disabled (the default) the process exits before listening.
+# ANVILKIT_MODEL_PROXY_CONTRACTS_DIR and the route credentials
+# ANVILKIT_MODEL_PROXY_CREDENTIAL_<NAME> (or <NAME>_FILE, a mounted file,
+# never both) that the routes below declare. Unknown keys and any other
+# ANVILKIT_MODEL_PROXY_* variable fail startup. Provider credentials,
+# principals, store placements and the contracts directory are refused
+# inside this file. With identity.mode disabled (the default) the process
+# exits before listening.
 # development: the top-level DEVELOPMENT_ONLY guard (P0.1). This checked-in
 # file configures host-side runs on the development foundation, whose
 # scenarios select the bearer listener identity (identity.mode development)

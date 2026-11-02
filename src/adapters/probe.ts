@@ -1,8 +1,9 @@
 // The unpaid route health probe (P2.3): GET <base_url>/models with the
-// route's credential, through node:https directly (the global fetch is
-// refused in this process), no redirect followed, no body kept. A route
-// whose latest probe failed refuses new calls as retryable
-// DEPENDENCY_UNAVAILABLE; calls already admitted are never touched. No
+// route's credential, through node:https directly (node:http for a
+// loopback route; the global fetch is refused in this process), no
+// redirect followed, no body kept. A route whose latest probe failed
+// refuses new calls as retryable DEPENDENCY_UNAVAILABLE; calls already
+// admitted are never touched. No
 // model is invoked: the probe proves reachability and the credential's
 // acceptance, never a paid send.
 import { request as httpRequest } from "node:http";

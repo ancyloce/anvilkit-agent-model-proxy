@@ -395,7 +395,7 @@ describe("P1.3 process and settlement safety", () => {
 			expect(elapsed).toBeLessThan(2000);
 			const reads = (await seeded.store.listReclaimed()).length;
 			expect(reads).toBe(1000);
-			// Readiness is a flag of the bootstrap, flipped before the first sweep (main.ts); the probe listener answers meanwhile.
+			// Readiness is a flag of the bootstrap, flipped without awaiting the first sweep (main.ts); the probe listener answers meanwhile.
 			const health = await call(seeded.healthUrl, "GET", "/readyz", undefined, null);
 			expect(health.status).toBe(200);
 		} finally {
