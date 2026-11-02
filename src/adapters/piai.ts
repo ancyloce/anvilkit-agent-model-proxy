@@ -1,10 +1,10 @@
 // The pi-ai adapter (B05, DD-03 §2 ControlledModelPort): protocol
 // adaptation of one call on one route through the pinned SDK's
 // openai-completions path — the only API path this build implements and
-// inspected (pi-ai 1.1.0 api/openai-completions.js: one OpenAI client per
+// inspected (pi-ai 1.4.0 api/openai-completions.js: one OpenAI client per
 // call built on the fetch the request option names; the SDK is called with
-// maxRetries 0 and pi's own retry wrapper retries nothing at maxRetries 0;
-// no fallback of its own). The model definition is built here from the
+// maxRetries 0 and pi's own retry wrapper, retryProviderRequest, retries
+// nothing at maxRetries 0; no fallback of its own). The model definition is built here from the
 // reviewed route, never from pi-ai's model registry or a caller's word; the
 // API key is the route credential; the transport is the ticket's fetch;
 // every request option that could add headers, sessions, caching or
@@ -204,10 +204,9 @@ export async function* streamUpstream(input: UpstreamInput): AsyncGenerator<Upst
 				yield { type: "text", delta: ev.delta };
 				break;
 			case "toolcall_end":
-				// pi-ai 1.3.0+: a tool call whose complete arguments text is not a
-				// JSON object arrives with `arguments: {}` and `argumentsError`
-				// (1.1.0 returned the fields parsed before the error). Neither is
-				// a tool call the executor may run: the call ends as an error and
+				// A tool call whose complete arguments text is not a JSON object
+				// arrives with `arguments: {}` and `argumentsError`. It is not a
+				// tool call the executor may run: the call ends as an error and
 				// no tool_call frame is relayed. Native evidence and metering keep
 				// the usage of the send.
 				if (ev.toolCall.argumentsError !== undefined) {

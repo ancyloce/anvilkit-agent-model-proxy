@@ -1,5 +1,5 @@
 // The guarded transport (DD-02 §4 step 5, DD-03 §6): the only outbound HTTP
-// path of the process. pi-ai 1.1.0 takes the fetch implementation of a
+// path of the process. pi-ai 1.4.0 takes the fetch implementation of a
 // call as a request option (ProviderRequestOptions.fetch, handed to the
 // vendor client it builds per call), so every send is made through the
 // fetch of one SendTicket — the consumed single-use permission of one call.
