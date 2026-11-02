@@ -21,23 +21,11 @@ import { streamUpstream } from "../adapters/piai.js";
 import { type CallStore, evidenceKeyOf, type NativeEvidence, PreconditionFailed } from "../adapters/store.js";
 import { SendTicket } from "../adapters/transport.js";
 import type { Config, Route } from "../config.js";
-import { routeDisabledReasons } from "../config.js";
-import {
-	type Contract,
-	type ErrorCode,
-	type ModelCall,
-	type ModelCallRequest,
-	type Outcome,
-	parseStrictJson,
-	type StreamFrame,
-	type Usage,
-} from "../contracts.js";
+import type { Contract, ModelCall, ModelCallRequest, Outcome, StreamFrame, Usage } from "../contracts.js";
 import {
 	BoundExceeded,
 	type CallRecord,
 	type CallScope,
-	canonicalJson,
-	digestOf,
 	Frames,
 	isTerminal,
 	type Observation,
@@ -45,49 +33,14 @@ import {
 	scopeOf,
 	timestamp,
 	toModelCall,
-	toolSchemaDigest,
 	usageFromOpenAI,
 	zeroUsage,
 } from "../domain/call.js";
 import type { Logger } from "../log.js";
+import { CallError, denialErrorCode, type Principal, refusalToCallError } from "./callerror.js";
+import { contentDigestOf, validateCall } from "./callrequest.js";
 
-export interface Principal {
-	id: string;
-	kind: "workflow" | "sidecar" | "control";
-}
-
-/** A refusal answered as an error envelope (no stream was opened). */
-export class CallError extends Error {
-	constructor(
-		readonly code: ErrorCode,
-		message: string,
-		readonly retryable = false,
-	) {
-		super(message);
-	}
-}
-
-/** The HTTP status of an error code on this surface (contracts.md §4). */
-export function statusOf(code: ErrorCode): number {
-	switch (code) {
-		case "INVALID_ARGUMENT":
-			return 400;
-		case "UNAUTHENTICATED":
-			return 401;
-		case "FORBIDDEN":
-		case "STALE_EXECUTION":
-		case "PROFILE_UNQUALIFIED":
-			return 403;
-		case "NOT_FOUND":
-			return 404;
-		case "IDEMPOTENCY_CONFLICT":
-			return 409;
-		case "BUDGET_EXHAUSTED":
-			return 429;
-		default:
-			return 503;
-	}
-}
+export { CallError, type Principal, statusOf } from "./callerror.js";
 
 export interface CallDeps {
 	cfg: Config;
@@ -149,147 +102,6 @@ export class CallService {
 		return this.live.size;
 	}
 
-	private route(id: string): Route {
-		const route = this.d.cfg.routes.find((r) => r.id === id);
-		if (!route) throw new CallError("PROFILE_UNQUALIFIED", `route ${id} is not a reviewed route of this Proxy`);
-		const reasons = routeDisabledReasons(this.d.cfg, route);
-		if (reasons.length > 0)
-			throw new CallError("PROFILE_UNQUALIFIED", `route ${id} is not enabled (${reasons.join(", ")})`);
-		return route;
-	}
-
-	/** The digest of the immutable content of a request: what a reentry must repeat exactly. */
-	private contentDigestOf(req: ModelCallRequest): string {
-		return digestOf(
-			canonicalJson({
-				binding: req.binding,
-				routeId: req.routeId,
-				messages: req.messages,
-				tools: req.tools ?? [],
-				maxOutputTokens: req.maxOutputTokens,
-				maxExposure: req.maxExposure,
-				deadline: req.deadline,
-				supersedesCallId: req.supersedesCallId ?? "",
-				evidenceRef: req.evidenceRef ?? "",
-			}),
-		);
-	}
-
-	/** Validates a new call against the route profile; returns the route and the deadline. */
-	private validate(req: ModelCallRequest): { route: Route; deadlineMs: number } {
-		const route = this.route(req.routeId);
-		if (this.d.health && !this.d.health.healthy(route.id))
-			throw new CallError(
-				"DEPENDENCY_UNAVAILABLE",
-				`route ${route.id} failed its latest health probe; no send was attempted`,
-				true,
-			);
-		const nowMs = this.now();
-		const deadlineMs = Date.parse(req.deadline);
-		if (Number.isNaN(deadlineMs)) throw new CallError("INVALID_ARGUMENT", "deadline is not a timestamp");
-		if (deadlineMs <= nowMs) throw new CallError("STALE_EXECUTION", "the call deadline has passed");
-		if (deadlineMs > nowMs + route.limits.maxDeadlineMs) {
-			throw new CallError(
-				"INVALID_ARGUMENT",
-				`the call deadline extends the route bound of ${route.limits.maxDeadlineMs}ms`,
-			);
-		}
-		if (req.maxOutputTokens > route.limits.maxOutputTokens) {
-			throw new CallError(
-				"INVALID_ARGUMENT",
-				`maxOutputTokens ${req.maxOutputTokens} exceeds the route bound ${route.limits.maxOutputTokens}`,
-			);
-		}
-		if (req.maxExposure.currency !== route.limits.maxExposure.currency) {
-			throw new CallError(
-				"INVALID_ARGUMENT",
-				`the route is bounded in ${route.limits.maxExposure.currency}, the exposure is declared in ${req.maxExposure.currency}`,
-			);
-		}
-		const amount = BigInt(req.maxExposure.amount);
-		if (amount <= 0n) throw new CallError("INVALID_ARGUMENT", "maxExposure must be positive");
-		if (amount > BigInt(route.limits.maxExposure.amount)) {
-			throw new CallError(
-				"INVALID_ARGUMENT",
-				`maxExposure ${req.maxExposure.amount} exceeds the route bound ${route.limits.maxExposure.amount}`,
-			);
-		}
-		const names = new Set<string>();
-		for (const t of req.tools ?? []) {
-			if (names.has(t.name)) throw new CallError("INVALID_ARGUMENT", `tool ${t.name} is named twice`);
-			names.add(t.name);
-			const schema = route.tools.find((s) => s.name === t.name);
-			if (!schema)
-				throw new CallError("PROFILE_UNQUALIFIED", `tool ${t.name} is not a reviewed tool of route ${route.id}`);
-			if (toolSchemaDigest(schema.inputSchema) !== t.inputSchemaDigest) {
-				throw new CallError(
-					"PROFILE_UNQUALIFIED",
-					`tool ${t.name}: the schema digest does not match the reviewed schema of route ${route.id}`,
-				);
-			}
-		}
-		this.validateToolHistory(req, route);
-		return { route, deadlineMs };
-	}
-
-	/**
-	 * The tool round trip of the message history: tool calls belong to
-	 * assistant messages, name a reviewed tool of the route with JSON-object
-	 * arguments and have distinct ids; a tool message answers exactly one
-	 * earlier assistant tool call; no other role carries either.
-	 */
-	private validateToolHistory(req: ModelCallRequest, route: Route): void {
-		const calls = new Map<string, string>();
-		const answered = new Set<string>();
-		req.messages.forEach((m, i) => {
-			const at = `messages[${i}]`;
-			if (m.role !== "assistant" && m.toolCalls !== undefined) {
-				throw new CallError("INVALID_ARGUMENT", `${at}: toolCalls belong to assistant messages`);
-			}
-			if (m.role !== "tool" && m.toolCallId !== undefined) {
-				throw new CallError("INVALID_ARGUMENT", `${at}: toolCallId belongs to tool messages`);
-			}
-			if (m.role === "assistant") {
-				for (const tc of m.toolCalls ?? []) {
-					if (calls.has(tc.toolCallId))
-						throw new CallError("INVALID_ARGUMENT", `${at}: tool call ${tc.toolCallId} repeats`);
-					if (!route.tools.some((s) => s.name === tc.name)) {
-						throw new CallError(
-							"PROFILE_UNQUALIFIED",
-							`${at}: tool ${tc.name} is not a reviewed tool of route ${route.id}`,
-						);
-					}
-					let args: unknown;
-					try {
-						args = parseStrictJson(tc.arguments);
-					} catch (err) {
-						throw new CallError("INVALID_ARGUMENT", `${at}: tool call ${tc.toolCallId}: ${(err as Error).message}`);
-					}
-					if (typeof args !== "object" || args === null || Array.isArray(args)) {
-						throw new CallError(
-							"INVALID_ARGUMENT",
-							`${at}: tool call ${tc.toolCallId}: arguments are not a JSON object`,
-						);
-					}
-					calls.set(tc.toolCallId, tc.name);
-				}
-			}
-			if (m.role === "tool") {
-				if (!m.toolCallId) throw new CallError("INVALID_ARGUMENT", `${at}: a tool message needs toolCallId`);
-				if (!calls.has(m.toolCallId)) {
-					throw new CallError(
-						"INVALID_ARGUMENT",
-						`${at}: tool call ${m.toolCallId} was not made by an earlier assistant message`,
-					);
-				}
-				if (answered.has(m.toolCallId)) {
-					throw new CallError("INVALID_ARGUMENT", `${at}: tool call ${m.toolCallId} is answered twice`);
-				}
-				answered.add(m.toolCallId);
-			}
-		});
-	}
-
 	// ---- authorization ------------------------------------------------------
 
 	/** The call's own caller: the principal that opened it, on any of its replicas. */
@@ -339,7 +151,7 @@ export class CallService {
 	 */
 	async open(principal: Principal, req: ModelCallRequest): Promise<AsyncGenerator<StreamFrame>> {
 		const scope: CallScope = { tenantId: req.binding.tenantId, callId: req.callId };
-		const contentDigest = this.contentDigestOf(req);
+		const contentDigest = contentDigestOf(req);
 		// A recorded call is answered from its record whatever the clock
 		// says now: a reconnect or a late query keeps the original identity
 		// and never opens a new send.
@@ -353,7 +165,7 @@ export class CallService {
 		if (this.closing) {
 			throw new CallError("DEPENDENCY_UNAVAILABLE", "the Proxy is draining; retry the call on another replica", true);
 		}
-		const { route, deadlineMs } = this.validate(req);
+		const { route, deadlineMs } = validateCall(req, this.d.cfg, this.d.health, this.now);
 		const admission = await this.admit(principal, req, route);
 		const nowIso = timestamp(this.now());
 		const base: CallRecord = {
@@ -596,9 +408,10 @@ export class CallService {
 			if (!(err instanceof PreconditionFailed)) throw err;
 			const found = await this.d.store.read(scopeOf(record));
 			if (!found) throw err;
-			// The create landed but its answer was lost and the SDK repeated
-			// it (P1.3, MP-10): the record carries this instance's stamp and
-			// this attempt's nonce, so it is this write, not another's.
+			// The create landed but its answer was lost and the store's AWS SDK
+			// client repeated it (maxAttempts 3; P1.3, MP-10): the record
+			// carries this instance's stamp and this attempt's nonce, so it is
+			// this write, not another's.
 			if (
 				record.createNonce !== undefined &&
 				found.record.createdBy === record.createdBy &&
@@ -1474,36 +1287,5 @@ export class CallService {
 	async close(): Promise<void> {
 		this.closing = true;
 		await Promise.all([...this.live.values()].map((l) => l.done));
-	}
-}
-
-function denialErrorCode(code: string): ErrorCode {
-	switch (code) {
-		case "STALE_EXECUTION":
-		case "PROFILE_UNQUALIFIED":
-		case "FORBIDDEN":
-		case "BUDGET_EXHAUSTED":
-		case "INVALID_ARGUMENT":
-			return code;
-		default:
-			return "FORBIDDEN";
-	}
-}
-
-function refusalToCallError(err: ControlRefused): CallError {
-	switch (err.code) {
-		case "IDEMPOTENCY_CONFLICT":
-		case "INVALID_ARGUMENT":
-		case "STALE_EXECUTION":
-		case "PROFILE_UNQUALIFIED":
-		case "BUDGET_EXHAUSTED":
-		case "FORBIDDEN":
-			return new CallError(err.code, err.message);
-		case "NOT_FOUND":
-			return new CallError("STALE_EXECUTION", `the execution binding names no current execution: ${err.message}`);
-		case "EFFECT_UNCERTAIN":
-			return new CallError("EFFECT_UNCERTAIN", err.message, true);
-		default:
-			return new CallError("FORBIDDEN", err.message);
 	}
 }
