@@ -69,6 +69,11 @@ export function loadMaterial(f: Files, now = new Date()): Material {
 	return parseMaterial(readFileSync(f.certFile), readFileSync(f.keyFile), readFileSync(f.caFile), now);
 }
 
+/** Whether the leaf was issued and signed by one of the trusted CAs (direct issuance; the development, chart and Compose issuers are single-level). */
+export function trusted(leaf: X509Certificate, cas: readonly X509Certificate[]): boolean {
+	return cas.some((ca) => leaf.checkIssued(ca) && leaf.verify(ca.publicKey));
+}
+
 /**
  * IdentityWatcher keeps the current Material of one set of files, polls
  * them for changes (mounted Secrets swap a ..data symlink; the files are
@@ -115,8 +120,12 @@ export class IdentityWatcher implements experimental.CertificateProvider {
 		this.timer = undefined;
 	}
 
-	onChange(fn: (previous: Material, current: Material) => void): void {
+	/** Registers fn for every published material; the returned function unregisters it. */
+	onChange(fn: (previous: Material, current: Material) => void): () => void {
 		this.changeListeners.add(fn);
+		return () => {
+			this.changeListeners.delete(fn);
+		};
 	}
 
 	/** Checks the files once; returns whether a new material was published. */

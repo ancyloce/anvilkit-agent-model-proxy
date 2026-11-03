@@ -1,23 +1,29 @@
 import { execFileSync } from "node:child_process";
+import { X509Certificate } from "node:crypto";
+import { once } from "node:events";
 import { readFileSync, writeFileSync } from "node:fs";
 import { request as httpRequest, type IncomingMessage } from "node:http";
-import { request as httpsRequest } from "node:https";
+import { Agent, request as httpsRequest } from "node:https";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
+import type { TLSSocket } from "node:tls";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ControlClient } from "../src/adapters/control.js";
 import { CallStore, FilesystemStore } from "../src/adapters/store.js";
 import { CallService } from "../src/application/calls.js";
 import { Contract } from "../src/contracts.js";
+import { IdentityWatcher } from "../src/identity.js";
 import { silentLogger } from "../src/log.js";
 import {
 	createHealthServer,
 	createServer,
+	currentTrustOnly,
 	MtlsIdentity,
 	parseSubjectAltName,
 	spiffeIdOf,
 } from "../src/transport/http.js";
 import { checkedInConfig, configFrom, scratch } from "./helpers.js";
+import { type CA, files, issue, mount, newCA, tempDir } from "./pki.js";
 
 function openssl(args: string[], cwd: string): void {
 	execFileSync("openssl", args, { cwd, stdio: "ignore" });
@@ -278,5 +284,150 @@ describe("SPIFFE principal mapping (F-P0.1-1)", () => {
 		expect(spiffeIdOf(`DNS:x, URI:${workflowId}`)).toBe(workflowId);
 		expect(parseSubjectAltName("no-colon")).toBeUndefined();
 		expect(parseSubjectAltName("DNS:a,DNS:b")).toEqual([{ type: "DNS", value: "a,DNS:b" }]);
+	});
+});
+
+describe.skipIf(!hasOpenssl)("mtls trust rotation", () => {
+	const proxyId = "spiffe://anvilkit.local/ns/anvilkit-apps/sa/anvilkit-agent-model-proxy";
+
+	/** One GET on the agent; the status and the socket that carried it. */
+	function getOn(agent: Agent, base: string): Promise<{ status: number; socket: TLSSocket; reused: boolean }> {
+		return new Promise((resolve, reject) => {
+			const u = new URL("/api/v1/model-calls/call_x", base);
+			let socket: TLSSocket | undefined;
+			const req = httpsRequest(
+				{ hostname: u.hostname, port: u.port, path: u.pathname, method: "GET", agent, servername: "localhost" },
+				(res) => {
+					res.resume();
+					res.on("end", () =>
+						resolve({ status: res.statusCode ?? 0, socket: socket as TLSSocket, reused: req.reusedSocket }),
+					);
+				},
+			);
+			req.on("socket", (s) => {
+				socket = s as TLSSocket;
+			});
+			req.on("error", reject);
+			req.end();
+		});
+	}
+
+	it("authenticates a request only while its connection's certificate is issued by a current CA", () => {
+		const ca1 = newCA("ca1");
+		const ca2 = newCA("ca2");
+		const leaf = new X509Certificate(issue(ca1, "anvilkit-agent-workflow", [workflowId]).certPem);
+		const request = {
+			socket: {
+				authorized: true,
+				getPeerX509Certificate: () => leaf,
+				getPeerCertificate: () => ({ subjectaltname: `URI:${workflowId}` }),
+			},
+		} as unknown as IncomingMessage;
+		let bundle = [new X509Certificate(ca1.pem), new X509Certificate(ca2.pem)];
+		const identity = currentTrustOnly(
+			new MtlsIdentity([{ spiffeId: workflowId, principalId: "workflow-principal", kind: "workflow" }]),
+			() => bundle,
+		);
+		expect(identity.authenticate(request)).toEqual({ id: "workflow-principal", kind: "workflow" });
+		bundle = [new X509Certificate(ca2.pem)];
+		expect(identity.authenticate(request), "ca1 retired, the handshake's verdict notwithstanding").toBeUndefined();
+		const noCertificate = { socket: { authorized: true, getPeerX509Certificate: () => undefined } };
+		expect(identity.authenticate(noCertificate as unknown as IncomingMessage)).toBeUndefined();
+	});
+
+	it("closes the connections a retired CA had verified, keeps the trusted ones and stops following the watcher once closed", async () => {
+		const ca1 = newCA("ca1");
+		const ca2 = newCA("ca2");
+		const both = Buffer.concat([ca1.pem, ca2.pem]);
+		const dir = tempDir();
+		mount(dir, issue(ca1, "localhost", [proxyId]), both);
+		const f = files(dir);
+		const cfg = configFrom(
+			checkedInConfig()
+				.replace("mode: disabled", "mode: mtls")
+				.replace(
+					"  mtls:\n    principals: []",
+					`  mtls:\n    cert_file: ${f.certFile}\n    key_file: ${f.keyFile}\n    ca_file: ${f.caFile}\n    principals:\n      - spiffe_id: ${workflowId}\n        principal_id: anvilkit-agent-workflow\n        kind: workflow`,
+				)
+				.replace(
+					"  identity:\n    mode: mtls\n    mtls:\n      server_name: anvilkit-agent-control\n",
+					"  identity:\n    mode: development\n",
+				),
+			{ ANVILKIT_MODEL_PROXY_STORE_DIR: scratch() },
+		);
+		const watcher = new IdentityWatcher(f, 60_000);
+		const control = new ControlClient("127.0.0.1:1", 500, cfg.control.identity);
+		const logged: string[] = [];
+		const server = createServer({
+			cfg,
+			contract: new Contract(),
+			calls: new CallService({
+				cfg,
+				contract: new Contract(),
+				control,
+				store: new CallStore(new FilesystemStore(cfg.store.dir)),
+				log: silentLogger,
+				instanceId: "rotation",
+			}),
+			identity: new MtlsIdentity(cfg.identity.mtls.principals),
+			identityWatcher: watcher,
+			log: { ...silentLogger, info: (msg) => logged.push(msg) },
+		});
+		// Idle kept-alive connections stay open for the whole test: only the
+		// rotation closes one.
+		server.keepAliveTimeout = 60_000;
+		const accepted: TLSSocket[] = [];
+		server.on("secureConnection", (socket: TLSSocket) => accepted.push(socket));
+		await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+		const base = `https://127.0.0.1:${(server.address() as AddressInfo).port}`;
+		const clientOf = (ca: CA) => {
+			const leaf = issue(ca, "anvilkit-agent-workflow", [workflowId]);
+			return new Agent({ keepAlive: true, maxSockets: 1, ca: both, cert: leaf.certPem, key: leaf.keyPem });
+		};
+		const retiring = clientOf(ca1);
+		const staying = clientOf(ca2);
+		try {
+			const before = await getOn(retiring, base);
+			expect(before.status, "a ca1 client during the transition").toBe(404);
+			const kept = await getOn(staying, base);
+			expect(kept.status, "a ca2 client during the transition").toBe(404);
+
+			// ca1 retired: the server leaf moves to ca2 and the bundle drops ca1.
+			const closed = once(before.socket, "close");
+			mount(dir, issue(ca2, "localhost", [proxyId]), ca2.pem);
+			expect(watcher.reload()).toBe(true);
+			expect(
+				accepted.map((a) => a.destroyed),
+				"the ca1 connection is closed at the rotation, the ca2 one kept",
+			).toEqual([true, false]);
+			await closed;
+			expect(logged).toContain("closed connections of retired trust");
+			expect(kept.socket.destroyed, "a connection the current bundle still trusts stays open").toBe(false);
+			const again = await getOn(staying, base);
+			expect(again.status).toBe(404);
+			expect(again.reused, "served on the kept connection").toBe(true);
+
+			// A new connection of the retired CA (a full handshake or a resumed
+			// session) authenticates nothing.
+			const retried = await getOn(retiring, base).then(
+				(r) => r.status,
+				() => "refused",
+			);
+			expect([401, "refused"]).toContain(retried);
+		} finally {
+			retiring.destroy();
+			staying.destroy();
+			server.closeAllConnections();
+			await new Promise<void>((r) => server.close(() => r()));
+			control.close();
+		}
+		// Closed: the listener no longer follows the watcher.
+		let followed = false;
+		(server as unknown as { setSecureContext: () => void }).setSecureContext = () => {
+			followed = true;
+		};
+		mount(dir, issue(ca2, "localhost", [proxyId]), both);
+		expect(watcher.reload()).toBe(true);
+		expect(followed).toBe(false);
 	});
 });

@@ -13,7 +13,7 @@
 // listener of their own: the kubelet presents no client certificate, so
 // they never share the mTLS business listener.
 
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual, type X509Certificate } from "node:crypto";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import { createServer as createHttpServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
@@ -25,7 +25,7 @@ import { CallError, type CallService, type Principal, statusOf } from "../applic
 import type { Config } from "../config.js";
 import type { Contract, ErrorCode, ErrorEnvelope, ModelCallRequest, StreamFrame } from "../contracts.js";
 import { ContractViolation } from "../contracts.js";
-import { IdentityWatcher } from "../identity.js";
+import { IdentityWatcher, trusted } from "../identity.js";
 import type { Logger } from "../log.js";
 import { type RequestObserver, routeOf, traceContext } from "../telemetry.js";
 
@@ -132,7 +132,8 @@ export function spiffeIdOf(subjectAltName: string | undefined): string | undefin
 
 /**
  * Workload mTLS (F-P0.1-1): the TLS layer verified the client certificate
- * against the watched bundle; its SPIFFE ID selects the configured principal
+ * against the watched bundle (createServer re-checks it against the current
+ * bundle on every request); its SPIFFE ID selects the configured principal
  * (identity.mtls.principals: spiffe_id -> principal_id, kind). The common
  * name is not consulted.
  */
@@ -219,9 +220,83 @@ function answerClientError(err: Error & { code?: string }, socket: import("node:
 	socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
 }
 
-/** The business listener: plaintext under the development identity, TLS with mandatory client certificates under mtls. */
+/** Whether the connection's client certificate was issued by a CA of the given bundle. */
+function peerTrusted(socket: TLSSocket, cas: readonly X509Certificate[]): boolean {
+	const leaf = typeof socket.getPeerX509Certificate === "function" ? socket.getPeerX509Certificate() : undefined;
+	return leaf !== undefined && trusted(leaf, cas);
+}
+
+/**
+ * Authenticates through identity only while the connection's client
+ * certificate was issued by a CA of the current bundle (cas, read per
+ * request): a connection verified under a CA since retired authenticates
+ * nothing, whether a request races its close or a TLS session was resumed.
+ */
+export function currentTrustOnly(identity: Identity, cas: () => readonly X509Certificate[]): Identity {
+	return {
+		describe: () => identity.describe(),
+		authenticate: (req) => (peerTrusted(req.socket as TLSSocket, cas()) ? identity.authenticate(req) : undefined),
+	};
+}
+
+/**
+ * The business listener: plaintext under the development identity, TLS with
+ * mandatory client certificates under mtls. Under mtls the watcher's every
+ * update becomes the secure context of new connections, and trust is
+ * re-checked against the current bundle twice: a rotation that retires a CA
+ * closes the open connections it had verified (their clients reconnect
+ * under the current trust; connections still trusted stay open, and a
+ * closed stream never cancels its send), and every request passes
+ * currentTrustOnly. The change listener is removed, and a watcher built
+ * here stopped, when the listener closes.
+ */
 export function createServer(d: HttpDeps): Server {
-	const handler = (req: IncomingMessage, res: ServerResponse) => {
+	if (d.cfg.identity.mode !== "mtls") {
+		const server = createHttpServer(requestHandler(d));
+		server.on("clientError", answerClientError);
+		return server;
+	}
+	const m = d.cfg.identity.mtls;
+	const watcher =
+		d.identityWatcher ?? new IdentityWatcher({ certFile: m.certFile, keyFile: m.keyFile, caFile: m.caFile }, 5000);
+	const cur = watcher.current();
+	const server = createHttpsServer(
+		{
+			cert: cur.certPem,
+			key: cur.keyPem,
+			ca: cur.caPem,
+			requestCert: true,
+			rejectUnauthorized: true,
+			minVersion: "TLSv1.3",
+		},
+		requestHandler({ ...d, identity: currentTrustOnly(d.identity, () => watcher.current().cas) }),
+	);
+	const open = new Set<TLSSocket>();
+	server.on("secureConnection", (socket: TLSSocket) => {
+		open.add(socket);
+		socket.once("close", () => open.delete(socket));
+	});
+	const stopFollowing = watcher.onChange((_previous, current) => {
+		server.setSecureContext({ cert: current.certPem, key: current.keyPem, ca: current.caPem });
+		let closed = 0;
+		for (const socket of open) {
+			if (peerTrusted(socket, current.cas)) continue;
+			socket.destroy();
+			closed++;
+		}
+		if (closed > 0) d.log.info("closed connections of retired trust", { connections: closed });
+	});
+	server.once("close", () => {
+		stopFollowing();
+		if (!d.identityWatcher) watcher.stop();
+	});
+	if (!d.identityWatcher) watcher.start();
+	server.on("clientError", answerClientError);
+	return server;
+}
+
+function requestHandler(d: HttpDeps): (req: IncomingMessage, res: ServerResponse) => void {
+	return (req, res) => {
 		const target = parseTarget(req.url);
 		let traceparent = "";
 		if (d.observer) {
@@ -242,39 +317,6 @@ export function createServer(d: HttpDeps): Server {
 				else res.destroy();
 			});
 	};
-	if (d.cfg.identity.mode === "mtls") {
-		// The watcher holds the validated material; every update it publishes
-		// becomes the listener's secure context for new connections (leaf and
-		// CA alike). The principal is the configured mapping of the client
-		// certificate's SPIFFE ID (F-P0.1-1, MtlsIdentity).
-		const m = d.cfg.identity.mtls;
-		const watcher =
-			d.identityWatcher ?? new IdentityWatcher({ certFile: m.certFile, keyFile: m.keyFile, caFile: m.caFile }, 5000);
-		const cur = watcher.current();
-		const server = createHttpsServer(
-			{
-				cert: cur.certPem,
-				key: cur.keyPem,
-				ca: cur.caPem,
-				requestCert: true,
-				rejectUnauthorized: true,
-				minVersion: "TLSv1.3",
-			},
-			handler,
-		);
-		watcher.onChange((_previous, current) =>
-			server.setSecureContext({ cert: current.certPem, key: current.keyPem, ca: current.caPem }),
-		);
-		if (!d.identityWatcher) {
-			watcher.start();
-			server.once("close", () => watcher.stop());
-		}
-		server.on("clientError", answerClientError);
-		return server;
-	}
-	const server = createHttpServer(handler);
-	server.on("clientError", answerClientError);
-	return server;
 }
 
 /**

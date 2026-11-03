@@ -23,7 +23,6 @@ export type ErrorEnvelope = Schemas["ErrorEnvelope"];
 export type ErrorCode = ErrorEnvelope["error"]["code"];
 export type ExecutionBinding = Schemas["ExecutionBinding"];
 export type Message = Schemas["Message"];
-export type MessageToolCall = Schemas["MessageToolCall"];
 export type ToolDefinition = Schemas["ToolDefinition"];
 export type ModelCallState = ModelCall["state"];
 export type Outcome = NonNullable<StreamFrame["outcome"]>;
