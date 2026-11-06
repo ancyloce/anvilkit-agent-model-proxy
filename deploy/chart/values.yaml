@@ -9,6 +9,9 @@
 
 image:
   repository: anvilkit-agent-model-proxy
+  # digest pins the exact image (repository@sha256:...) and is required
+  # outside development (RB-S10); the tag, defaulting to the chart's
+  # appVersion, renders only with development.enabled.
   tag: ""
   digest: ""
   pullPolicy: IfNotPresent

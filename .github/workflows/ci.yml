@@ -55,7 +55,20 @@ jobs:
           helm lint deploy/chart --set control.address=anvilkit-agent-control:9101 --set identity.trustDomain=ci.example --set identity.certificate.issuerRef.name=ci-issuer --set config.identity.mtls.principals[0].spiffe_id=spiffe://ci.example/ns/anvilkit-apps/sa/anvilkit-agent-workflow --set config.identity.mtls.principals[0].principal_id=anvilkit-agent-workflow --set config.identity.mtls.principals[0].kind=workflow
           --set store.s3.endpoint=https://minio:9000 --set store.s3.bucket=anvilkit-model-proxy --set store.s3.secret.name=model-proxy-store
           --set identity.principalsSecret.name=model-proxy-principals
+          --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001
       - run: >-
           helm template anvilkit-agent-model-proxy deploy/chart --set control.address=anvilkit-agent-control:9101 --set identity.trustDomain=ci.example --set identity.certificate.issuerRef.name=ci-issuer --set config.identity.mtls.principals[0].spiffe_id=spiffe://ci.example/ns/anvilkit-apps/sa/anvilkit-agent-workflow --set config.identity.mtls.principals[0].principal_id=anvilkit-agent-workflow --set config.identity.mtls.principals[0].kind=workflow
           --set store.s3.endpoint=https://minio:9000 --set store.s3.bucket=anvilkit-model-proxy --set store.s3.secret.name=model-proxy-store
-          --set identity.principalsSecret.name=model-proxy-principals > /dev/null
+          --set identity.principalsSecret.name=model-proxy-principals
+          --set image.digest=sha256:0000000000000000000000000000000000000000000000000000000000000001 > /dev/null
+      - name: Refuse a tag-only image outside development (RB-S10)
+        run: |
+          sets=(--set control.address=anvilkit-agent-control:9101 --set identity.trustDomain=ci.example --set identity.certificate.issuerRef.name=ci-issuer
+            --set 'config.identity.mtls.principals[0].spiffe_id=spiffe://ci.example/ns/anvilkit-apps/sa/anvilkit-agent-workflow'
+            --set 'config.identity.mtls.principals[0].principal_id=anvilkit-agent-workflow' --set 'config.identity.mtls.principals[0].kind=workflow'
+            --set store.s3.endpoint=https://minio:9000 --set store.s3.bucket=anvilkit-model-proxy --set store.s3.secret.name=model-proxy-store
+            --set identity.principalsSecret.name=model-proxy-principals)
+          if out=$(helm template anvilkit-agent-model-proxy deploy/chart "${sets[@]}" 2>&1); then echo "rendered a tag-only image outside development"; exit 1; fi
+          echo "$out" | grep -q "image.digest is required outside development" || { echo "$out"; exit 1; }
+          # The development guard keeps the tag (DEVELOPMENT_ONLY).
+          helm template anvilkit-agent-model-proxy deploy/chart "${sets[@]}" --set development.enabled=true > /dev/null

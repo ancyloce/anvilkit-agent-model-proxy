@@ -34,13 +34,16 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
-{{/* The image reference: a digest pins the exact image, otherwise the tag
+{{/* The image reference: a digest pins the exact image. Outside development
+the digest is required (RB-S10); only development.enabled renders the tag
 (defaulting to the chart's appVersion). */}}
 {{- define "anvilkit-agent-model-proxy.image" -}}
 {{- if .Values.image.digest -}}
 {{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
-{{- else -}}
+{{- else if .Values.development.enabled -}}
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) -}}
+{{- else -}}
+{{- fail "image.digest is required outside development: a tag is mutable and only a digest pins the image (RB-S10); the tag renders only with development.enabled: true" -}}
 {{- end -}}
 {{- end -}}
 
