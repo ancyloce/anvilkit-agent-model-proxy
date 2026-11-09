@@ -155,6 +155,7 @@ export async function run(cfg: Config): Promise<void> {
 			// retryable, the listener closed to new connections, in-flight sends
 			// run to their bounded end and are settled and observed; the bound
 			// covers the longest route send (validated by the configuration).
+			const begun = performance.now();
 			ready = false;
 			calls.beginClose();
 			clearInterval(sweep);
@@ -164,10 +165,12 @@ export async function run(cfg: Config): Promise<void> {
 				log.error("drain bound reached with sends in flight; they are reclaimed by the sweep", {
 					inFlight: calls.inFlight,
 				});
+				telemetry.stopped(performance.now() - begun, true);
 				resolve();
 			}, cfg.http.shutdownTimeoutMs);
 			void calls.close().then(() => {
 				clearTimeout(bound);
+				telemetry.stopped(performance.now() - begun, false);
 				resolve();
 			});
 		};

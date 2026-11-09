@@ -70,6 +70,22 @@ describe("telemetry", () => {
 		await t.shutdown();
 	});
 
+	it("records the configuration generation and the last stop's drain and forced stop (RB-A25)", async () => {
+		const t = new Telemetry({ otlpEndpoint: "", sampleRatio: 1 }, "test");
+		let metrics = await t.registry.metrics();
+		expect(metrics).toContain("anvilkit_model_proxy_config_generation 1");
+		expect(metrics).toContain("anvilkit_model_proxy_shutdown_forced 0");
+		t.stopped(1500, false);
+		metrics = await t.registry.metrics();
+		expect(metrics).toContain("anvilkit_model_proxy_shutdown_drain_seconds 1.5");
+		expect(metrics).toContain("anvilkit_model_proxy_shutdown_forced 0");
+		t.stopped(20000, true);
+		metrics = await t.registry.metrics();
+		expect(metrics).toContain("anvilkit_model_proxy_shutdown_drain_seconds 20");
+		expect(metrics).toContain("anvilkit_model_proxy_shutdown_forced 1");
+		await t.shutdown();
+	});
+
 	it("hands the sampled server span's context to the request (P3.6)", async () => {
 		const exporter = new InMemorySpanExporter();
 		const t = new Telemetry({ otlpEndpoint: "", sampleRatio: 1 }, "test", new SimpleSpanProcessor({ exporter }));

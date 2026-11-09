@@ -82,6 +82,8 @@ export class Telemetry implements RequestObserver, CallObserver {
 	private readonly sweepEntries: Counter<"action">;
 	private readonly sweepDuration: Histogram;
 	private readonly pending: Gauge;
+	private readonly drainSeconds: Gauge;
+	private readonly forcedStop: Gauge;
 
 	constructor(cfg: TelemetryConfig, service: string, processor?: SpanProcessor) {
 		collectDefaultMetrics({ register: this.registry });
@@ -119,6 +121,25 @@ export class Telemetry implements RequestObserver, CallObserver {
 		this.pending = new Gauge({
 			name: "anvilkit_model_proxy_pending_observations",
 			help: "Calls whose usage observation the last sweep pass found pending (not yet accepted by Control).",
+			registers: [this.registry],
+		});
+		// The DD-09 §6 lifecycle signals (RB-A25), named as Knowledge and MCP
+		// name theirs: the active configuration generation (one per process; a
+		// rejected candidate never starts), the last stop's drain time and
+		// whether the drain bound ended it with sends still in flight.
+		new Gauge({
+			name: "anvilkit_model_proxy_config_generation",
+			help: "Number of the active configuration generation (one per process: a changed input takes effect through a rolling restart).",
+			registers: [this.registry],
+		}).set(1);
+		this.drainSeconds = new Gauge({
+			name: "anvilkit_model_proxy_shutdown_drain_seconds",
+			help: "Seconds the last shutdown spent draining in-flight sends before the listeners closed.",
+			registers: [this.registry],
+		});
+		this.forcedStop = new Gauge({
+			name: "anvilkit_model_proxy_shutdown_forced",
+			help: "1 when the last shutdown's drain bound passed with sends in flight (the sweep reclaims them).",
 			registers: [this.registry],
 		});
 		const spans =
@@ -184,6 +205,12 @@ export class Telemetry implements RequestObserver, CallObserver {
 	}
 
 	/** Flushes the spans within the bound; the provider is closed afterwards. */
+	/** Records a shutdown's drain time and whether its bound ended it. */
+	stopped(drainMs: number, forced: boolean): void {
+		this.drainSeconds.set(drainMs / 1000);
+		if (forced) this.forcedStop.set(1);
+	}
+
 	async shutdown(): Promise<void> {
 		await this.provider?.shutdown();
 	}
