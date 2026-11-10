@@ -521,10 +521,3 @@ export class StreamingUsage {
 		return out;
 	}
 }
-
-/** The native usage of a complete captured body (the whole stream fed at once). */
-export function nativeUsageFromSse(body: Uint8Array): { usage: unknown; responseId?: string } | undefined {
-	const u = new StreamingUsage();
-	u.feed(body);
-	return u.result();
-}

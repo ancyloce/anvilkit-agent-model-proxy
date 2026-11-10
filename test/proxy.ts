@@ -13,9 +13,9 @@ import { CallStore, FilesystemStore, type ObjectStore } from "../src/adapters/st
 import { CallService } from "../src/application/calls.js";
 import type { Config } from "../src/config.js";
 import { Contract, type ModelCallRequest, type StreamFrame } from "../src/contracts.js";
-import { type Logger, silentLogger } from "../src/log.js";
+import type { Logger } from "../src/log.js";
 import { createHealthServer, createServer, DevelopmentIdentity } from "../src/transport/http.js";
-import { checkedInConfig, configFrom, scratch } from "./helpers.js";
+import { checkedInConfig, configFrom, scratch, silentLogger } from "./helpers.js";
 
 export const token = "workflow-token-fixture";
 export const sidecarToken = "sidecar-token-fixture";

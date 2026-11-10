@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { probeModels, RouteHealth } from "../src/adapters/probe.js";
 import type { Config, Route } from "../src/config.js";
-import { silentLogger } from "../src/log.js";
+import { silentLogger } from "./helpers.js";
 
 let server: Server | undefined;
 afterEach(() => server?.close());

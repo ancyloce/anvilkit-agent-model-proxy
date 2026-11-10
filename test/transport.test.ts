@@ -2,16 +2,23 @@ import { encode } from "eventsource-encoder";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { contextOf, streamUpstream, type UpstreamEvent } from "../src/adapters/piai.js";
 import {
-	nativeUsageFromSse,
 	refusingFetch,
 	SEND_ALREADY_ATTEMPTED,
 	SendTicket,
+	StreamingUsage,
 	TransportRefused,
 } from "../src/adapters/transport.js";
 import type { Route } from "../src/config.js";
 import { Upstream } from "./upstream.js";
 
 const credential = "fixture-credential";
+
+/** The native usage of a complete captured body: the whole stream fed to the production parser at once. */
+function nativeUsageFromSse(body: Uint8Array): { usage: unknown; responseId?: string } | undefined {
+	const u = new StreamingUsage();
+	u.feed(body);
+	return u.result();
+}
 
 function route(baseUrl: string): Route {
 	return {

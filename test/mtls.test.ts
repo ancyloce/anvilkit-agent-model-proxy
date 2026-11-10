@@ -13,7 +13,6 @@ import { CallStore, FilesystemStore } from "../src/adapters/store.js";
 import { CallService } from "../src/application/calls.js";
 import { Contract } from "../src/contracts.js";
 import { IdentityWatcher } from "../src/identity.js";
-import { silentLogger } from "../src/log.js";
 import {
 	createHealthServer,
 	createServer,
@@ -22,7 +21,7 @@ import {
 	parseSubjectAltName,
 	spiffeIdOf,
 } from "../src/transport/http.js";
-import { checkedInConfig, configFrom, scratch } from "./helpers.js";
+import { checkedInConfig, configFrom, scratch, silentLogger } from "./helpers.js";
 import { type CA, files, issue, mount, newCA, tempDir } from "./pki.js";
 
 function openssl(args: string[], cwd: string): void {

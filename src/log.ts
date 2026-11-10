@@ -24,5 +24,3 @@ export function jsonLogger(out: (line: string) => void = (line) => process.stdou
 		error: (m, f) => emit("ERROR", m, f),
 	};
 }
-
-export const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };

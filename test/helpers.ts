@@ -3,6 +3,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Config, loadFrom } from "../src/config.js";
+import type { Logger } from "../src/log.js";
+
+/** The logger of the unit tests: every line discarded. */
+export const silentLogger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
 
 export const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
