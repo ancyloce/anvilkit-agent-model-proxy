@@ -568,6 +568,10 @@ describe("pi-ai openai-completions path on the ticket's fetch", () => {
 				streamUpstream(input(ticket, { route: { ...route(up.url), provider: "deepseek" } })),
 			);
 			expect(events.at(-1)?.type).toBe("error");
+			// Only a reply cut at the output limit has a class of its own.
+			expect((events.at(-1) as Extract<UpstreamEvent, { type: "error" }>).code).toBe(
+				finish === "length" ? "UPSTREAM_FINISH_LENGTH" : undefined,
+			);
 			expect(up.receives.length).toBe(before + 1);
 			await ticket.settled;
 			expect(nativeUsageFromSse(ticket.response?.body ?? new Uint8Array())?.usage).toMatchObject({

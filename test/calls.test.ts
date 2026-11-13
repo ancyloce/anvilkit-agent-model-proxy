@@ -427,7 +427,7 @@ describe("controlled calls", () => {
 		}
 	});
 
-	it("a token-limited reply fails without losing metering or resending on reentry", async () => {
+	it("a token-limited reply fails as UPSTREAM_FINISH_LENGTH without losing metering or resending on reentry", async () => {
 		const before = up.receives.length;
 		up.next({ kind: "stream", text: ["Partial"], finish: "length", usageOnFinish: true });
 		const callId = id("token-limited");
@@ -436,7 +436,7 @@ describe("controlled calls", () => {
 		expect(first.frames.at(-1)).toMatchObject({
 			type: "error",
 			outcome: "failed",
-			errorCode: "UPSTREAM_ERROR",
+			errorCode: "UPSTREAM_FINISH_LENGTH",
 			usage: { inputUnits: "12", outputUnits: "5" },
 		});
 		const replay = await call(proxy.url, "POST", "/api/v1/model-calls", body);

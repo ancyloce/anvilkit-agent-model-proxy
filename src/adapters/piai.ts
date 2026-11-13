@@ -37,8 +37,10 @@ export type UpstreamEvent =
 			 * The adapter's own classification of the failure when the SDK's
 			 * event establishes it (a structured fact of the stream, never read
 			 * from a message text): the settlement carries it as the error code.
+			 * UPSTREAM_FINISH_LENGTH: the reply reached its output token limit
+			 * (the SDK's stop reason `length`) and was cut.
 			 */
-			code?: "UPSTREAM_TOOL_ARGUMENTS_INVALID";
+			code?: "UPSTREAM_TOOL_ARGUMENTS_INVALID" | "UPSTREAM_FINISH_LENGTH";
 	  };
 
 export interface UpstreamInput {
@@ -232,10 +234,13 @@ export async function* streamUpstream(input: UpstreamInput): AsyncGenerator<Upst
 				// The relay has no partial/deferred success state. A token limit
 				// must not become a successful coding turn (or execute a partial
 				// tool call). Native evidence and metering still retain its usage.
+				// A cut reply keeps its own class, so that a role whose output
+				// outgrew its cap is not reported as a generic upstream error.
 				if (ev.reason !== "stop" && ev.reason !== "toolUse") {
 					yield {
 						type: "error",
 						reason: "error",
+						...(ev.reason === "length" ? { code: "UPSTREAM_FINISH_LENGTH" as const } : {}),
 						message: `UPSTREAM_FINISH_${ev.reason.toUpperCase()}`,
 						final: ev.message,
 					};
