@@ -408,9 +408,11 @@ describe("controlled calls", () => {
 
 	it("a refused connection is a certain not-sent: failed with explicit zero usage", async () => {
 		const closed = await new Upstream().start();
-		const url = closed.url;
+		// The proxy binds its own listeners before the upstream's port is freed: a port-0 bind after the close may be
+		// handed the freed port, and the call is then answered instead of refused (parent CI 44564913608). A fixed port
+		// cannot replace the freed one: fetch refuses port 1 (a bad port), and hosts drop closed ports outside the range.
+		const other = await startProxy({ upstreamUrl: closed.url, controlAddress: control.address, instanceId: "closed" });
 		await closed.closeListener();
-		const other = await startProxy({ upstreamUrl: url, controlAddress: control.address, instanceId: "closed" });
 		try {
 			const callId = id("refused");
 			const r = await call(other.url, "POST", "/api/v1/model-calls", requestBody(callId));
