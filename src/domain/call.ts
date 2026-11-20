@@ -101,6 +101,13 @@ export interface CallRecord {
 	 * such a record is never expired while its evidence is missing.
 	 */
 	reclaimedAt?: string;
+	/**
+	 * DEC-068 (CR-04): the reclaim of a send on a fencing route also fenced
+	 * its stream at this time. The record's frames and outcome stay those of
+	 * the reclaim; a late settlement of the original sender adds only its
+	 * usage (and its outcome to Control's ledger), so no stream write follows.
+	 */
+	fencedAt?: string;
 }
 
 /**
@@ -136,6 +143,7 @@ export function toModelCall(r: CallRecord): ModelCall {
 	if (r.usage) out.usage = r.usage;
 	if (r.nativeReference) out.nativeReference = r.nativeReference;
 	if (r.errorCode) out.errorCode = r.errorCode;
+	if (r.fencedAt) out.fencedAt = r.fencedAt;
 	return out;
 }
 

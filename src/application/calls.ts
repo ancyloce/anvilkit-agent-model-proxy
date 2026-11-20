@@ -788,6 +788,35 @@ export class CallService {
 				});
 				return;
 			}
+			if (rec.fencedAt !== undefined) {
+				// DEC-068 (CR-04): the reclaim fenced the stream. A late
+				// settlement of the original sender adds its usage, and its
+				// outcome reaches Control's ledger, so the cost is actual; the
+				// record keeps the reclaim's frames and outcome, so nothing the
+				// sender produced after the fence becomes a result.
+				if (rec.evidenceRef === evidenceRef) return;
+				rec.evidenceRef = evidenceRef;
+				if (settlement.usage) rec.usage = settlement.usage;
+				if (settlement.nativeReference) rec.nativeReference = settlement.nativeReference;
+				if (settlement.outcome !== "unknown" || settlement.usage) {
+					rec.observations.push(
+						this.observationOf(rec, settlement.outcome, settlement.usage, settlement.nativeReference),
+					);
+				}
+				this.d.log.warn("a late settlement of a fenced send: its usage is kept, its frames and result are not", {
+					callId: scope.callId,
+					dispatchId: rec.dispatchId,
+					outcome: settlement.outcome,
+				});
+				try {
+					await this.writeRecord(rec, found.version);
+					return;
+				} catch (err) {
+					if (!(err instanceof PreconditionFailed)) throw err;
+					this.d.log.info("record moved during settlement; reapplying", { callId: scope.callId });
+					continue;
+				}
+			}
 			if (rec.evidenceRef === evidenceRef && rec.state === settlement.outcome) return;
 			let observe = true;
 			if (isTerminal(rec.state)) {
@@ -1137,6 +1166,8 @@ export class CallService {
 				rec.errorCode = "SENDER_LOST";
 				rec.reclaimedAt = timestamp(this.now());
 				const route = this.d.cfg.routes.find((r) => r.id === rec.routeId);
+				// DEC-068 (CR-04): on a fencing route the reclaim is the sender's stop.
+				if (route?.fenceOnReclaim) rec.fencedAt = rec.reclaimedAt;
 				rec.frames = this.staticFrames(
 					rec.callId,
 					route ?? ({ limits: { maxFrameBytes: 65536, maxOutputBytes: 1, maxFrames: 2 } } as Route),

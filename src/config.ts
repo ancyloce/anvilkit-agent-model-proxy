@@ -56,6 +56,14 @@ export interface Route {
 	tools: ToolSchema[];
 	/** P2.3: the unpaid health probe of the route (GET <base_url>/models), or none. */
 	healthProbe: "none" | "models";
+	/**
+	 * DEC-068 (CR-04): a reclaim of a lost send on this route also fences its
+	 * stream (the record's fencedAt): a late settlement of the original sender
+	 * then adds its usage and outcome to the ledger, never frames or a result.
+	 * Set for the chat route, whose turn needs the sender proven stopped; off
+	 * elsewhere, where a late result may still complete the record.
+	 */
+	fenceOnReclaim: boolean;
 }
 
 /**
@@ -601,6 +609,7 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 				"limits",
 				"tools",
 				"health_probe",
+				"fence_on_reclaim",
 			];
 			for (const k of Object.keys(r)) {
 				if (!known.includes(k)) errors.push(`${prefix}: unknown key ${k}`);
@@ -637,6 +646,8 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 			const healthProbe = String(r.health_probe ?? "none");
 			if (healthProbe !== "none" && healthProbe !== "models")
 				errors.push(`${prefix}.health_probe must be none or models (an unpaid GET of <base_url>/models)`);
+			if (r.fence_on_reclaim !== undefined && typeof r.fence_on_reclaim !== "boolean")
+				errors.push(`${prefix}.fence_on_reclaim must be true or false`);
 			const credentialEnv = String(r.credential_env ?? "");
 			if (!credentialEnvPattern.test(credentialEnv)) {
 				errors.push(`${prefix}.credential_env must match ANVILKIT_MODEL_PROXY_CREDENTIAL_<NAME>`);
@@ -716,6 +727,7 @@ function build(raw: Raw, credentialValues: Map<string, string>, credentials: Map
 					limits,
 					tools,
 					healthProbe: healthProbe === "models" ? "models" : "none",
+					fenceOnReclaim: r.fence_on_reclaim === true,
 				});
 			}
 		});
