@@ -21,8 +21,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ancyloce/anvilkit-agent-contracts
-          ref: b3fe8697697902fb8c0767c2463f0af7c945842a
+          ref: c06ac01827d50f12ea9dfe0785dd7b346e815055
           path: contracts
+      # The contracts checkout is the commit package.json pins @anvilkit/generated-clients to;
+      # the image build then proves the Dockerfile's document hash against the same commit, so
+      # the three pins move together (a release builds with the parent's contracts gitlink).
+      - name: Contracts checkout is the package.json pin
+        run: test "$(git -C contracts rev-parse HEAD)" = "$(grep -oE 'anvilkit-agent-contracts#[0-9a-f]{40}' package.json | cut -d'#' -f2)"
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24.19.0"
@@ -41,8 +46,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ancyloce/anvilkit-agent-contracts
-          ref: b3fe8697697902fb8c0767c2463f0af7c945842a
+          ref: c06ac01827d50f12ea9dfe0785dd7b346e815055
           path: contracts
+      # The contracts checkout is the commit package.json pins @anvilkit/generated-clients to;
+      # the image build then proves the Dockerfile's document hash against the same commit, so
+      # the three pins move together (a release builds with the parent's contracts gitlink).
+      - name: Contracts checkout is the package.json pin
+        run: test "$(git -C contracts rev-parse HEAD)" = "$(grep -oE 'anvilkit-agent-contracts#[0-9a-f]{40}' package.json | cut -d'#' -f2)"
       - run: docker build --build-context contracts=contracts -t anvilkit-agent-model-proxy:ci .
   chart:
     runs-on: ubuntu-24.04
