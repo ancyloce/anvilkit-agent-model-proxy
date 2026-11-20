@@ -30,6 +30,7 @@ function route(baseUrl: string): Route {
 		baseUrl,
 		credentialEnv: "ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1",
 		healthProbe: "none",
+		fenceOnReclaim: false,
 		limits: {
 			maxOutputTokens: 4096,
 			maxExposure: { currency: "USD", amount: "1000000" },

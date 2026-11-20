@@ -1437,6 +1437,7 @@ describe("two Proxy instances on one store", () => {
 		});
 		const g = await call(a.url, "GET", `/api/v1/model-calls/${callId}`);
 		expect(g.json).toMatchObject({ state: "unknown", errorCode: "SENDER_LOST" });
+		expect(g.json).not.toHaveProperty("fencedAt");
 		const replay = await call(
 			a.url,
 			"POST",
@@ -1592,6 +1593,88 @@ describe("two Proxy instances on one store", () => {
 		expect(control.byCall(vague)?.observations).toHaveLength(1);
 		expect(control.byCall(vague)?.state).toBe(DispatchState.DISPATCH_STATE_UNKNOWN);
 		expect(up.receives.length).toBe(sends);
+	});
+
+	it("DEC-068 (CR-04): on a fencing route the reclaim fences the stream: a late settlement adds its usage and its outcome to the ledger, never frames or a result", async () => {
+		const credLine = "    credential_env: ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1\n";
+		// Its own store: no unfenced instance sweeps this send.
+		const f = await startProxy({
+			upstreamUrl: up.url,
+			controlAddress: control.address,
+			instanceId: "f",
+			configEdits: (y) => y.replace(credLine, `${credLine}    fence_on_reclaim: true\n`),
+		});
+		try {
+			expect(f.cfg.routes.find((r) => r.id === "controlled-openai-v1")?.fenceOnReclaim).toBe(true);
+			const callId = `call_fenced_${Date.now()}`;
+			const scope = { tenantId: "tenant_a", callId };
+			fakeDispatch(callId, "tenant_a", "dsp_fake_fenced");
+			const past = new Date(Date.now() - 2000).toISOString();
+			await f.store.create(sendingRecord(callId, "tenant_a", "dsp_fake_fenced", past));
+			await f.store.markPending(scope, past);
+			const sends = up.receives.length;
+			expect((await f.calls.sweep()).reclaimed).toBe(1);
+			const reclaimed = (await f.store.read(scope))?.record;
+			expect(reclaimed).toMatchObject({ state: "unknown", errorCode: "SENDER_LOST" });
+			expect(reclaimed?.fencedAt).toBeDefined();
+			expect(reclaimed?.fencedAt).toBe(reclaimed?.reclaimedAt);
+			const reclaimFrames = reclaimed?.frames;
+			const g1 = await call(f.url, "GET", `/api/v1/model-calls/${callId}`);
+			expect(g1.json).toMatchObject({ state: "unknown", errorCode: "SENDER_LOST", fencedAt: reclaimed?.fencedAt });
+			// The sender, alive after all, persists its evidence with a complete settlement.
+			const usage = { inputUnits: "13", outputUnits: "3", reasoningUnits: "0", cachedInputUnits: "0" };
+			const frames: StreamFrame[] = [
+				{ callId, sequence: "0", type: "admitted" },
+				{ callId, sequence: "1", type: "text", text: "after the fence" },
+				{ callId, sequence: "2", type: "usage", usage },
+				{ callId, sequence: "3", type: "done", outcome: "succeeded", usage },
+			];
+			await f.store.writeEvidence({
+				callId,
+				tenantId: "tenant_a",
+				dispatchId: "dsp_fake_fenced",
+				routeId: "controlled-openai-v1",
+				capturedAt: new Date().toISOString(),
+				request: {
+					method: "POST",
+					url: `${up.url}/v1/chat/completions`,
+					contentType: "",
+					body: "{}",
+					bodyTruncated: false,
+				},
+				wireAttempts: 1,
+				response: { status: 200, headers: {}, bodyBase64: "", bodyBytes: 0, bodyTruncated: false },
+				settlement: { outcome: "succeeded", usage, nativeReference: "chatcmpl-fenced", frames },
+			});
+			expect((await f.calls.sweep()).completed).toBe(1);
+			const rec = (await f.store.read(scope))?.record;
+			expect(rec).toMatchObject({
+				state: "unknown",
+				errorCode: "SENDER_LOST",
+				usage,
+				evidenceRef: `evidence/${callId}/tenant_a`,
+			});
+			expect(rec?.frames).toEqual(reclaimFrames);
+			// Control learns the actual outcome and usage: the cost is actual and the exposure resolved.
+			for (let i = 0; i < 100 && control.byCall(callId)?.state !== DispatchState.DISPATCH_STATE_OBSERVED; i++)
+				await new Promise((r) => setTimeout(r, 50));
+			expect(control.byCall(callId)?.state).toBe(DispatchState.DISPATCH_STATE_OBSERVED);
+			expect(control.byCall(callId)?.observations.at(-1)).toMatchObject({
+				outcome: DispatchOutcome.DISPATCH_OUTCOME_SUCCEEDED,
+				usage: { input: "13", output: "3" },
+			});
+			const g2 = await call(f.url, "GET", `/api/v1/model-calls/${callId}`);
+			expect(g2.json).toMatchObject({
+				state: "unknown",
+				errorCode: "SENDER_LOST",
+				usage,
+				fencedAt: reclaimed?.fencedAt,
+			});
+			expect(await f.calls.sweep()).toMatchObject({ completed: 0, reclaimed: 0 });
+			expect(up.receives.length).toBe(sends);
+		} finally {
+			await f.close();
+		}
 	});
 
 	it("evidence of another dispatch never settles a record: the call keeps its own outcome", async () => {

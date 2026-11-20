@@ -114,6 +114,15 @@ describe("configuration", () => {
 		).toThrow(/health_probe must be none or models/);
 	});
 
+	it("DEC-068: fence_on_reclaim is a route boolean, off by default", () => {
+		const cred = "credential_env: ANVILKIT_MODEL_PROXY_CREDENTIAL_CONTROLLED_OPENAI_V1";
+		expect(configFrom(base).routes.every((r) => !r.fenceOnReclaim)).toBe(true);
+		expect(configFrom(base.replace(cred, `${cred}\n    fence_on_reclaim: true`)).routes[0]?.fenceOnReclaim).toBe(true);
+		expect(() => configFrom(base.replace(cred, `${cred}\n    fence_on_reclaim: "yes"`))).toThrow(
+			/fence_on_reclaim must be true or false/,
+		);
+	});
+
 	it("requires the development inputs once the profile is enabled and validates ranges", () => {
 		expect(() => configFrom(base.replace("mode: disabled", "mode: development"))).toThrow(ConfigError);
 		expect(() => configFrom(base.replace("mode: disabled", "mode: development"), devEnv)).not.toThrow();
