@@ -51,10 +51,10 @@ COPY --from=build /src/dist ./dist
 COPY package.json ./package.json
 COPY config.yaml /etc/anvilkit/anvilkit-agent-model-proxy/config.yaml
 COPY --from=contracts openapi/model-proxy.yaml /anvilkit/contracts/openapi/model-proxy.yaml
-# openapi/model-proxy.yaml of contracts commit c06ac01827d50f12ea9dfe0785dd7b346e815055 (tag go/v0.1.51, the commit
+# openapi/model-proxy.yaml of contracts commit e7de8dafcc1e885051395cc50b75fc25e9de5e0638777015f88c2e364dbf982f (tag go/v0.1.52, the commit
 # @anvilkit/generated-clients is pinned to; ModelCall.fencedAt, DEC-068)
 # (line endings normalized: a CRLF checkout carries the same document).
-ARG CONTRACT_SHA256=2d0b8896571af8c50db776ae06782d4a5e7c86929700143fdc3f91d37827485b
+ARG CONTRACT_SHA256=e7de8dafcc1e885051395cc50b75fc25e9de5e0638777015f88c2e364dbf982f
 RUN test "$(tr -d '\r' < /anvilkit/contracts/openapi/model-proxy.yaml | sha256sum | cut -d' ' -f1)" = "$CONTRACT_SHA256" \
  || { echo "openapi/model-proxy.yaml is not the document of the pinned contracts commit" >&2; exit 1; }
 ENV ANVILKIT_MODEL_PROXY_CONFIG=/etc/anvilkit/anvilkit-agent-model-proxy/config.yaml \
