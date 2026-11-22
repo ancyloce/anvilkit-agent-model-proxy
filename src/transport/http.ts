@@ -379,8 +379,9 @@ async function handle(d: HttpDeps, req: IncomingMessage, res: ServerResponse, ur
 		if (req.method === "POST" && url.pathname === "/api/v1/model-calls") {
 			const text = await readBody(req, d.cfg.http.maxBodyBytes);
 			const request = d.contract.parse<ModelCallRequest>("ModelCallRequest", text);
-			const stream = await d.calls.open(principal, request);
-			await writeSse(d, res, request.callId, stream);
+			const identity = asksFrameIdentity(req.headers.accept);
+			const stream = await d.calls.open(principal, request, identity);
+			await writeSse(d, res, request.callId, stream, identity);
 			return;
 		}
 		const m = callPath.exec(url.pathname);
@@ -422,6 +423,22 @@ async function handle(d: HttpDeps, req: IncomingMessage, res: ServerResponse, ur
 	}
 }
 
+/** D4a (DEC-070): the media type of a stream whose frames carry their stream identity. */
+const frameIdentityMediaType = "text/event-stream; frame-identity=1";
+
+/**
+ * Whether the caller asked for the frames' stream identity (createModelCall):
+ * an Accept range `text/event-stream` with the parameter `frame-identity=1`.
+ * Any other Accept keeps the frames as before D4a.
+ */
+export function asksFrameIdentity(accept: string | undefined): boolean {
+	if (!accept) return false;
+	return accept.split(",").some((range) => {
+		const [type, ...params] = range.split(";").map((p) => p.trim().toLowerCase());
+		return type === "text/event-stream" && params.some((p) => p.replace(/\s*=\s*/, "=") === "frame-identity=1");
+	});
+}
+
 /**
  * Writes the frames as SSE (id = sequence); a slow consumer is dropped after
  * the grace, the send continues. Everything registered here belongs to this
@@ -436,9 +453,10 @@ async function writeSse(
 	res: ServerResponse,
 	callId: string,
 	frames: AsyncGenerator<StreamFrame>,
+	identity = false,
 ): Promise<void> {
 	res.writeHead(200, {
-		"content-type": "text/event-stream",
+		"content-type": identity ? frameIdentityMediaType : "text/event-stream",
 		"cache-control": "no-store",
 		connection: "keep-alive",
 		"x-accel-buffering": "no",
