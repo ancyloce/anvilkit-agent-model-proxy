@@ -2,7 +2,7 @@
 // controlled call, its state machine, the bounded frame sequence of the
 // StreamFrame contract, the digests the Proxy binds and the classification
 // of native usage. No I/O here.
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { ExecutionBinding, ModelCall, ModelCallState, Outcome, StreamFrame, Usage } from "../contracts.js";
 
 /** sha256 of bytes as the contract Digest ("sha256:" + 64 hex). */
@@ -80,6 +80,12 @@ export interface CallRecord {
 	createdAt: string;
 	updatedAt: string;
 	revision: number;
+	/**
+	 * D4a (DEC-070): the identity of the call's original stream, created once
+	 * with the record; absent on a record made before D4a. Stored frames never
+	 * carry it: it is added to the frames of a caller that asks for it.
+	 */
+	originalStreamId?: string;
 	/** The normalized frames of a completed send, replayed to a reentering caller. */
 	frames: StreamFrame[];
 	observations: Observation[];
@@ -197,6 +203,58 @@ export function encodedFrameBytes(frame: StreamFrame): number {
 	return utf8Bytes(JSON.stringify(frame));
 }
 
+// ---- stream identity (D4a, design 0001 §8.2, DEC-070) ---------------------
+
+export type FrameOrigin = NonNullable<StreamFrame["frameOrigin"]>;
+
+/** A new original stream identity: `str_` and 24 hex digits, a contract Id. */
+export function newOriginalStreamId(): string {
+	return `str_${randomBytes(12).toString("hex")}`;
+}
+
+/**
+ * The encoded bytes the stream identity adds to a frame, at most: every
+ * frame reserves them, so a frame stays within the route's bound whether or
+ * not its caller asked for the identity.
+ */
+export const frameIdentityBytes =
+	encodedFrameBytes({
+		callId: "c",
+		sequence: "0",
+		type: "text",
+		frameOrigin: "recovery",
+		originalStreamId: newOriginalStreamId(),
+	}) - encodedFrameBytes({ callId: "c", sequence: "0", type: "text" });
+
+/** The error codes of the synthetic frames that replace a lost send's stream. */
+const recoveryErrorCodes: ReadonlySet<string> = new Set(["SENDER_LOST", "PERMISSION_LOST"]);
+
+/**
+ * Whether a recorded frame list is the synthetic recovery pair (admitted, then
+ * error SENDER_LOST or PERMISSION_LOST): no original stream sends those codes,
+ * so the list's own final frame tells, whatever Proxy release recorded it.
+ */
+export function isRecoveryFrames(frames: readonly StreamFrame[]): boolean {
+	const last = frames.at(-1);
+	return last?.type === "error" && last.errorCode !== undefined && recoveryErrorCodes.has(last.errorCode);
+}
+
+/**
+ * A frame as a caller that reads the stream identity sees it: a recovery
+ * frame is marked so and names no stream; an original frame names the call's
+ * original stream, or stays as it is when its record has none (made before
+ * D4a), so the caller records the reply whole.
+ */
+export function withIdentity(
+	frame: StreamFrame,
+	origin: FrameOrigin,
+	originalStreamId: string | undefined,
+): StreamFrame {
+	if (origin === "recovery") return { ...frame, frameOrigin: "recovery" };
+	if (originalStreamId === undefined) return frame;
+	return { ...frame, frameOrigin: "original", originalStreamId };
+}
+
 /** The bytes one code point occupies inside a JSON string (JSON.stringify escaping; raw UTF-8 otherwise). */
 function jsonStringBytes(codePoint: number): number {
 	if (codePoint === 0x22 || codePoint === 0x5c) return 2; // \" and \\
@@ -232,12 +290,13 @@ export class Frames {
 		readonly bounds: FrameBounds,
 		private readonly sink?: (f: StreamFrame) => void,
 	) {
-		const envelope = encodedFrameBytes({
-			callId,
-			sequence: "9".repeat(String(bounds.maxFrames).length),
-			type: "text",
-			text: "",
-		});
+		const envelope =
+			encodedFrameBytes({
+				callId,
+				sequence: "9".repeat(String(bounds.maxFrames).length),
+				type: "text",
+				text: "",
+			}) + frameIdentityBytes;
 		this.textBudget = Math.min(contractTextBytes, bounds.maxFrameBytes - envelope);
 	}
 
@@ -261,7 +320,9 @@ export class Frames {
 		// A final frame is bounded by the contract itself (ids, counters and the
 		// error code have fixed maxima, under 512 bytes together), never by the
 		// route: the outcome always fits.
-		if (!final && encodedFrameBytes(full) > this.bounds.maxFrameBytes) throw new BoundExceeded("FRAME_BOUND_EXCEEDED");
+		if (!final && encodedFrameBytes(full) + frameIdentityBytes > this.bounds.maxFrameBytes) {
+			throw new BoundExceeded("FRAME_BOUND_EXCEEDED");
+		}
 		this.frames.push(full);
 		this.sink?.(full);
 		return full;
