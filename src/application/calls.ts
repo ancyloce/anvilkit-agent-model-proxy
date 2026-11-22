@@ -27,13 +27,16 @@ import {
 	type CallRecord,
 	type CallScope,
 	Frames,
+	isRecoveryFrames,
 	isTerminal,
+	newOriginalStreamId,
 	type Observation,
 	type Settlement,
 	scopeOf,
 	timestamp,
 	toModelCall,
 	usageFromOpenAI,
+	withIdentity,
 	zeroUsage,
 } from "../domain/call.js";
 import type { Logger } from "../log.js";
@@ -62,6 +65,8 @@ export interface CallDeps {
 /** An in-flight send owned by this process. */
 interface LiveCall {
 	scope: CallScope;
+	/** D4a: the record's original stream (every live frame is original). */
+	originalStreamId?: string;
 	frames: StreamFrame[];
 	subscribers: Set<(f: StreamFrame | null) => void>;
 	abort: AbortController;
@@ -149,7 +154,7 @@ export class CallService {
 	 * its live send) and never sends again; a new call is admitted and, when
 	 * this request holds the permission, sent once. Returns the frame stream.
 	 */
-	async open(principal: Principal, req: ModelCallRequest): Promise<AsyncGenerator<StreamFrame>> {
+	async open(principal: Principal, req: ModelCallRequest, identity = false): Promise<AsyncGenerator<StreamFrame>> {
 		const scope: CallScope = { tenantId: req.binding.tenantId, callId: req.callId };
 		const contentDigest = contentDigestOf(req);
 		// A recorded call is answered from its record whatever the clock
@@ -158,7 +163,7 @@ export class CallService {
 		const existing = await this.d.store.read(scope);
 		if (existing) {
 			this.reentry(principal, existing.record, req, contentDigest);
-			return this.attach(existing.record, Date.parse(existing.record.deadline));
+			return this.attach(existing.record, Date.parse(existing.record.deadline), identity);
 		}
 		// A draining process admits nothing new (P1.3): the caller retries the
 		// same call id on another replica; nothing was asked of Control.
@@ -190,6 +195,7 @@ export class CallService {
 			observations: [],
 			createdBy: this.source,
 			createNonce: randomBytes(8).toString("hex"),
+			originalStreamId: newOriginalStreamId(),
 		};
 		if (admission.denialCode) {
 			const record = { ...base, state: "denied" as const, errorCode: admission.denialCode };
@@ -208,7 +214,7 @@ export class CallService {
 			const record = await this.awaitRecord(scope, this.d.cfg.control.admissionRetry.maxIntervalMs);
 			if (record) {
 				this.reentry(principal, record, req, contentDigest);
-				return this.attach(record, deadlineMs);
+				return this.attach(record, deadlineMs, identity);
 			}
 			const lost = await this.createOrAttachRecord({ ...base, state: "unknown", errorCode: "PERMISSION_LOST" });
 			if (lost.created) {
@@ -225,7 +231,7 @@ export class CallService {
 				// Recorded meanwhile: attached only as the identity it was recorded for.
 				this.reentry(principal, lost.record, req, contentDigest);
 			}
-			return this.attach(lost.record, deadlineMs);
+			return this.attach(lost.record, deadlineMs, identity);
 		}
 		// This request holds the single permission. The record with the
 		// dispatch identity is durable before any byte leaves the process: a
@@ -240,12 +246,12 @@ export class CallService {
 			// identity it was recorded for. Anything else recorded under this
 			// scope is never overwritten.
 			const taken = await this.takeOver(principal, created.record, created.version, base, req, contentDigest);
-			if (!taken) return this.attach(created.record, deadlineMs);
+			if (!taken) return this.attach(created.record, deadlineMs, identity);
 			record = taken.record;
 			version = taken.version;
 		}
 		const live = this.startSend(record, version, route, req, deadlineMs);
-		return this.attachLive(live);
+		return this.attachLive(live, identity);
 	}
 
 	private reentry(principal: Principal, record: CallRecord, req: ModelCallRequest, contentDigest: string): void {
@@ -467,6 +473,7 @@ export class CallService {
 		const scope = scopeOf(record);
 		const live: LiveCall = {
 			scope,
+			originalStreamId: record.originalStreamId,
 			frames: [],
 			subscribers: new Set(),
 			abort,
@@ -857,7 +864,8 @@ export class CallService {
 
 	// ---- attaching callers ------------------------------------------------
 
-	private attachLive(live: LiveCall): AsyncGenerator<StreamFrame> {
+	/** A live send's frames, all original; with the caller's identity when it asked (D4a). */
+	private attachLive(live: LiveCall, identity: boolean): AsyncGenerator<StreamFrame> {
 		const queue: (StreamFrame | null)[] = [...live.frames];
 		let wake: (() => void) | undefined;
 		const push = (f: StreamFrame | null) => {
@@ -879,7 +887,7 @@ export class CallService {
 					}
 					const f = queue.shift();
 					if (f === null || f === undefined) return;
-					yield f;
+					yield identity ? withIdentity(f, "original", live.originalStreamId) : f;
 				}
 			} finally {
 				live.subscribers.delete(push);
@@ -887,11 +895,16 @@ export class CallService {
 		})();
 	}
 
-	/** Replays a recorded call; a send owned elsewhere is awaited through the store until it is terminal or reclaimable. */
-	private attach(record: CallRecord, deadlineMs: number): AsyncGenerator<StreamFrame> {
+	/**
+	 * Replays a recorded call; a send owned elsewhere is awaited through the
+	 * store until it is terminal or reclaimable. With the caller's identity
+	 * (D4a), a recorded recovery pair is marked recovery, any other recorded
+	 * frames original.
+	 */
+	private attach(record: CallRecord, deadlineMs: number, identity: boolean): AsyncGenerator<StreamFrame> {
 		const scope = scopeOf(record);
 		const live = this.live.get(keyOf(scope));
-		if (live) return this.attachLive(live);
+		if (live) return this.attachLive(live, identity);
 		const self = this;
 		return (async function* () {
 			let current = record;
@@ -904,11 +917,12 @@ export class CallService {
 				current = again.record;
 				const nowLive = self.live.get(keyOf(scope));
 				if (nowLive) {
-					yield* self.attachLive(nowLive);
+					yield* self.attachLive(nowLive, identity);
 					return;
 				}
 			}
-			for (const f of current.frames) yield f;
+			const origin = isRecoveryFrames(current.frames) ? "recovery" : "original";
+			for (const f of current.frames) yield identity ? withIdentity(f, origin, current.originalStreamId) : f;
 		})();
 	}
 
