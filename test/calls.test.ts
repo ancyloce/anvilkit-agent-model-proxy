@@ -1965,3 +1965,65 @@ describe("two Proxy instances on one store", () => {
 		expect(up.receives.length).toBe(sends);
 	});
 });
+
+// D4a (DEC-070, design 0001 §8.2): a caller that asks for the stream
+// identity gets every frame marked original with the record's stream, the
+// same on a reentry, and a recovery pair marked recovery; any other caller
+// gets the frames as before D4a.
+describe("frame identity", () => {
+	let up: Upstream;
+	let control: FakeControl;
+	let proxy: RunningProxy;
+	let n = 0;
+	const id = (name: string) => `call_${name}_${++n}_${Date.now()}`;
+	const scope = (callId: string) => ({ tenantId: "tenant_a", callId });
+
+	beforeAll(async () => {
+		up = await new Upstream().start();
+		control = await new FakeControl().start();
+		proxy = await startProxy({ upstreamUrl: up.url, controlAddress: control.address, instanceId: "a" });
+	});
+	afterEach(() => {
+		up.release();
+		control.loseAdmitAnswers = 0;
+	});
+	afterAll(async () => {
+		await proxy.close();
+		await control.stop();
+		await up.stop();
+	});
+	it("original frames name the call's one original stream when asked, and only then", async () => {
+		const accept = { accept: "text/event-stream; frame-identity=1" };
+		up.next({ kind: "stream", text: ["Hello", " world"] });
+		const callId = id("identity");
+		const body = requestBody(callId);
+		const r = await call(proxy.url, "POST", "/api/v1/model-calls", body, token, undefined, undefined, accept);
+		expect(r.status, r.text).toBe(200);
+		expect(r.headers["content-type"]).toBe("text/event-stream; frame-identity=1");
+		const stream = r.frames[0]?.originalStreamId;
+		expect(stream).toMatch(/^str_[0-9a-f]{24}$/);
+		expect(r.frames.map((f) => [f.frameOrigin, f.originalStreamId])).toEqual(r.frames.map(() => ["original", stream]));
+		expect((await proxy.store.read(scope(callId)))?.record.originalStreamId).toBe(stream);
+		expect((await proxy.store.read(scope(callId)))?.record.frames.some((f) => "frameOrigin" in f)).toBe(false);
+		const again = await call(proxy.url, "POST", "/api/v1/model-calls", body, token, undefined, undefined, accept);
+		expect(again.frames).toEqual(r.frames);
+		const plain = await call(proxy.url, "POST", "/api/v1/model-calls", body);
+		expect(plain.headers["content-type"]).toBe("text/event-stream");
+		expect(plain.frames.some((f) => "frameOrigin" in f || "originalStreamId" in f)).toBe(false);
+		expect(plain.frames.map((f) => f.text)).toEqual(r.frames.map((f) => f.text));
+	});
+
+	it("the PERMISSION_LOST pair is recovery and names no stream", async () => {
+		control.loseAdmitAnswers = 1;
+		const callId = id("identity_lost");
+		const r = await call(proxy.url, "POST", "/api/v1/model-calls", requestBody(callId), token, undefined, undefined, {
+			accept: "application/json, text/event-stream;frame-identity=1",
+		});
+		expect(r.status, r.text).toBe(200);
+		expect(r.frames.map((f) => [f.type, f.frameOrigin, f.originalStreamId])).toEqual([
+			["admitted", "recovery", undefined],
+			["error", "recovery", undefined],
+		]);
+		expect(r.frames[1]).toMatchObject({ outcome: "unknown", errorCode: "PERMISSION_LOST" });
+	});
+});

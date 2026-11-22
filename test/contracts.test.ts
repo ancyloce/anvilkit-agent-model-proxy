@@ -7,6 +7,7 @@ import {
 	digestOf,
 	encodedFrameBytes,
 	Frames,
+	frameIdentityBytes,
 	parseTimestampMicros,
 	timestamp,
 	toolSchemaDigest,
@@ -94,9 +95,10 @@ describe("contract boundary", () => {
 
 describe("domain", () => {
 	it("bounds the frame sequence in encoded UTF-8 bytes, reserves the final frame's slot and closes once", () => {
-		// The envelope of a text frame of call_1 with a one-digit sequence is 58 bytes: a
-		// 62-byte bound leaves four bytes of escaped text per frame.
-		const envelope = encodedFrameBytes({ callId: "call_1", sequence: "9", type: "text", text: "" });
+		// The envelope of a text frame of call_1 with a one-digit sequence is 58 bytes plus the
+		// stream identity's reserve (D4a): a bound four bytes above leaves four bytes of text.
+		const envelope =
+			encodedFrameBytes({ callId: "call_1", sequence: "9", type: "text", text: "" }) + frameIdentityBytes;
 		const f = new Frames("call_1", { maxFrameBytes: envelope + 4, maxOutputBytes: 10, maxFrames: 8 });
 		f.admitted();
 		f.text("abcdefghij");

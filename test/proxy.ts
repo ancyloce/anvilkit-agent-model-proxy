@@ -147,7 +147,7 @@ export interface Reply {
 	json?: unknown;
 }
 
-/** One HTTP request; an SSE answer is collected into frames (optionally stopping early); `agent` selects the connection reuse. */
+/** One HTTP request; an SSE answer is collected into frames (optionally stopping early); `agent` selects the connection reuse; `extra` adds request headers. */
 export function call(
 	url: string,
 	method: string,
@@ -156,10 +156,11 @@ export function call(
 	auth: string | null = token,
 	stopAfter?: (frames: StreamFrame[]) => boolean,
 	agent?: Agent,
+	extra: Record<string, string> = {},
 ): Promise<Reply> {
 	return new Promise((resolve, reject) => {
 		const u = new URL(pathname, url);
-		const headers: Record<string, string> = { "content-type": "application/json" };
+		const headers: Record<string, string> = { "content-type": "application/json", ...extra };
 		if (auth !== null) headers.authorization = `Bearer ${auth}`;
 		const req = httpRequest({ method, hostname: u.hostname, port: u.port, path: u.pathname, headers, agent }, (res) => {
 			const chunks: Buffer[] = [];
