@@ -41,10 +41,11 @@ RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack 
 # Debian security fixes the base digest predates (with a fixed version:
 # CRITICAL CVE-2026-13221/42496/8376 perl-base; HIGH
 # CVE-2026-86145/89157/89161/103111 libpcre2, CVE-2026-109518 apt and its
-# libapt-pkg), pinned to the fixed versions.
+# libapt-pkg), pinned to the fixed versions; the 2026-11-23 scan adds the
+# liblzma5 and tzdata point releases.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends --only-upgrade perl-base=5.36.0-7+deb12u4 libpcre2-8-0=10.42-1+deb12u2 \
-      apt=2.6.2 libapt-pkg6.0=2.6.2 \
+      apt=2.6.2 libapt-pkg6.0=2.6.2 liblzma5=5.4.1-1+deb12u2 tzdata=2026f-0+deb12u1 \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /prod/node_modules ./node_modules
 COPY --from=build /src/dist ./dist

@@ -407,11 +407,12 @@ describe("pi-ai openai-completions path on the ticket's fetch", () => {
 		expect(r.headers.authorization).toBe(`Bearer ${credential}`);
 		expect(r.headers["user-agent"]).toBe("anvilkit-agent-model-proxy");
 		expect(Object.keys(r.headers).some((h) => h.startsWith("x-anvilkit-"))).toBe(false);
-		// pi-ai 1.4.0 adds client-identity attribution headers only when an
+		// pi-ai 1.6.0 adds client-identity attribution headers only when an
 		// identity is passed; the service passes none and keeps its own
 		// User-Agent (options headers merge last).
 		expect(r.headers["http-referer"]).toBeUndefined();
 		expect(r.headers["x-title"]).toBeUndefined();
+		expect(r.headers["x-openrouter-title"]).toBeUndefined();
 		const body = JSON.parse(r.body) as Record<string, unknown>;
 		expect(body.model).toBe("fixture-model");
 		expect(body.stream).toBe(true);

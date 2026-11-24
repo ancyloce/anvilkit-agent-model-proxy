@@ -1,7 +1,7 @@
 // The pi-ai adapter (B05, DD-03 §2 ControlledModelPort): protocol
 // adaptation of one call on one route through the pinned SDK's
 // openai-completions path — the only API path this build implements and
-// inspected (pi-ai 1.4.0 api/openai-completions.js: one OpenAI client per
+// inspected (pi-ai 1.6.0 api/openai-completions.js, re-read against 1.4.0: one OpenAI client per
 // call built on the fetch the request option names; the SDK is called with
 // maxRetries 0 and pi's own retry wrapper, retryProviderRequest, retries
 // nothing at maxRetries 0; no fallback of its own). The model definition is built here from the
@@ -80,6 +80,10 @@ export function modelOf(route: Route): Model<"openai-completions"> {
 			maxTokensField: "max_tokens",
 			requiresToolResultName: false,
 			requiresAssistantAfterToolResult: false,
+			requiresNonNullAssistantContent: false,
+			// pi-ai 1.5.1 made `"tools": []` for a tool history opt-in; the relay
+			// keeps the body its routes were reviewed with.
+			requiresToolsWithToolHistory: true,
 			requiresThinkingAsText: false,
 			requiresReasoningContentOnAssistantMessages: false,
 			thinkingFormat: deepseek ? "deepseek" : "openai",
@@ -88,6 +92,7 @@ export function modelOf(route: Route): Model<"openai-completions"> {
 			supportsStrictMode: false,
 			supportsOpenAIGrammarTools: false,
 			sendSessionAffinityHeaders: false,
+			promptCacheKeyMode: "disabled",
 			supportsLongCacheRetention: false,
 		},
 	};
