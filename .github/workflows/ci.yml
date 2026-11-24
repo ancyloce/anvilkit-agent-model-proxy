@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ancyloce/anvilkit-agent-contracts
-          ref: e707f7e1c712111e4ee520ceb36ace9a390bdb28
+          ref: 0f4bbd0d95cbed44fde6e958211d017c49c50231
           path: contracts
       # The contracts checkout is the commit package.json pins @anvilkit/generated-clients to;
       # the image build then proves the Dockerfile's document hash against the same commit, so
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ancyloce/anvilkit-agent-contracts
-          ref: e707f7e1c712111e4ee520ceb36ace9a390bdb28
+          ref: 0f4bbd0d95cbed44fde6e958211d017c49c50231
           path: contracts
       # The contracts checkout is the commit package.json pins @anvilkit/generated-clients to;
       # the image build then proves the Dockerfile's document hash against the same commit, so

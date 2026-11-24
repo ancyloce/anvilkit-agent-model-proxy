@@ -52,7 +52,7 @@ COPY --from=build /src/dist ./dist
 COPY package.json ./package.json
 COPY config.yaml /etc/anvilkit/anvilkit-agent-model-proxy/config.yaml
 COPY --from=contracts openapi/model-proxy.yaml /anvilkit/contracts/openapi/model-proxy.yaml
-# openapi/model-proxy.yaml of contracts commit e707f7e1c712111e4ee520ceb36ace9a390bdb28 (tag go/v0.1.52, the commit
+# openapi/model-proxy.yaml of contracts commit 0f4bbd0d95cbed44fde6e958211d017c49c50231 (tag go/v0.1.53, the commit
 # @anvilkit/generated-clients is pinned to; ModelCall.fencedAt, DEC-068)
 # (line endings normalized: a CRLF checkout carries the same document).
 ARG CONTRACT_SHA256=e7de8dafcc1e885051395cc50b75fc25e9de5e0638777015f88c2e364dbf982f

@@ -113,8 +113,8 @@ importers:
   .:
     dependencies:
       '@anvilkit/generated-clients':
-        specifier: github:ancyloce/anvilkit-agent-contracts#e707f7e1c712111e4ee520ceb36ace9a390bdb28&path:ts
-        version: https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/e707f7e1c712111e4ee520ceb36ace9a390bdb28#path:ts
+        specifier: github:ancyloce/anvilkit-agent-contracts#0f4bbd0d95cbed44fde6e958211d017c49c50231&path:ts
+        version: https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/0f4bbd0d95cbed44fde6e958211d017c49c50231#path:ts
       '@aws-sdk/client-s3':
         specifier: 3.1134.0
         version: 3.1134.0
@@ -194,8 +194,8 @@ packages:
       zod:
         optional: true
 
-  '@anvilkit/generated-clients@https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/e707f7e1c712111e4ee520ceb36ace9a390bdb28#path:ts':
-    resolution: {gitHosted: true, integrity: sha512-8B8ropkAvNoY4QWvOUbW7USWmlEDNJVWCpu12lw+LnpkRpTzvXDSnJvqBjSvqIS3KgUnjyaAsAP5Angfg8FjJg==, path: ts, tarball: https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/e707f7e1c712111e4ee520ceb36ace9a390bdb28}
+  '@anvilkit/generated-clients@https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/0f4bbd0d95cbed44fde6e958211d017c49c50231#path:ts':
+    resolution: {gitHosted: true, integrity: sha512-Q1hOcSZQYdUWhUEzuRHAB7i6uaukhqVve/Jx6gorEY7X5K47MOxzCfR/fsvBhX1rn0SZMLgXBFqq/4nDuCi3gw==, path: ts, tarball: https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/0f4bbd0d95cbed44fde6e958211d017c49c50231}
     version: 0.1.0
 
   '@aws-sdk/checksums@3.1001.0':
@@ -1400,7 +1400,7 @@ snapshots:
       json-schema-to-ts: 3.1.1
       standardwebhooks: 1.1.1
 
-  '@anvilkit/generated-clients@https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/e707f7e1c712111e4ee520ceb36ace9a390bdb28#path:ts':
+  '@anvilkit/generated-clients@https://codeload.github.com/ancyloce/anvilkit-agent-contracts/tar.gz/0f4bbd0d95cbed44fde6e958211d017c49c50231#path:ts':
     dependencies:
       '@bufbuild/protobuf': 2.15.0
       '@bufbuild/protovalidate': 1.2.0(@bufbuild/protobuf@2.15.0)
